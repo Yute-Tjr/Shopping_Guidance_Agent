@@ -1,0 +1,69 @@
+# ===== 通用 =====
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.swp
+*.bak
+*.tmp
+
+# ===== Python / 后端 =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenv
+.venv/
+venv/
+env/
+
+# 环境变量（API Key）
+.env
+.env.*
+!.env.example
+
+# 本地数据：Milvus Lite / 上传图片缓存 / 评测结果
+server/data/
+server/uploads/
+data/
+
+# ===== iOS / Swift =====
+# Xcode 用户配置
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+*.xcscmblueprint
+*.xccheckout
+
+# 构建产物
+build/
+DerivedData/
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# CocoaPods（本项目用 SPM，但兜底排除）
+Pods/
+Podfile.lock
+
+# Swift Package Manager
+.swiftpm/
+.build/
+Package.resolved
+
+# ===== Docker =====
+docker/mysql/mysql_data/
+
+# ===== 课题原始资料（保留在仓库，但不重复跟踪本地副本） =====
+# ecommerce_agent_dataset/  # 主体数据需要提交，按需取消下面这行注释
+/课题说明会：基于 RAG 的多模态电商智能导购 AI Agent.pdf
+/server/.env.example

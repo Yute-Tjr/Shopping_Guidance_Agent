@@ -1,0 +1,17 @@
+[project]
+name = "shopping-guide-server"
+version = "0.1.0"
+description = "基于 RAG 的多模态电商智能导购 AI Agent 后端"
+requires-python = ">=3.11,<3.13"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501"]
