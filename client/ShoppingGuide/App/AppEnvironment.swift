@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 
 /// 全局环境：保存后端 BaseURL 与匿名会话 ID。
 /// Phase 0 仅做最小占位，Phase 2 起再注入更多依赖（APIClient、SessionStore 等）。
