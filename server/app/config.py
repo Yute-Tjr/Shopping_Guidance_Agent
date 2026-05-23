@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     ark_model: str = "ep-20260514111645-lmgt2"
 
     # ---- Embedding ----
+    # 留空时回退到 ark_api_key；当 LLM 与 Embedding 不在同一个方舟账号下时，
+    # 在 .env 里单独配 ARK_EMBEDDING_API_KEY 以走自己的账号调 Embedding 端点。
+    ark_embedding_api_key: str | None = None
     embedding_model: str = "doubao-embedding-text-240715"
     vision_embedding_model: str = "doubao-embedding-vision-241215"
     embedding_dim: int = 2048
