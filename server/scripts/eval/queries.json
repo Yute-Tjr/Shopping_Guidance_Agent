@@ -1,0 +1,152 @@
+[
+  {
+    "id": "q01",
+    "intent": "category_recommend",
+    "query": "推荐一款抗初老精华",
+    "gold": ["p_beauty_001", "p_beauty_009", "p_beauty_024"]
+  },
+  {
+    "id": "q02",
+    "intent": "category_recommend",
+    "query": "高倍防晒霜推荐",
+    "gold": ["p_beauty_006", "p_beauty_010", "p_beauty_023"]
+  },
+  {
+    "id": "q03",
+    "intent": "category_recommend",
+    "query": "敏感肌可以用的修护面霜",
+    "gold": ["p_beauty_007", "p_beauty_012"]
+  },
+  {
+    "id": "q04",
+    "intent": "category_recommend",
+    "query": "适合早上喝的速溶咖啡",
+    "gold": ["p_food_001", "p_food_002", "p_food_022"]
+  },
+  {
+    "id": "q05",
+    "intent": "category_recommend",
+    "query": "想买 256G 的苹果手机",
+    "gold": ["p_digital_001", "p_digital_003"]
+  },
+  {
+    "id": "q06",
+    "intent": "category_recommend",
+    "query": "推荐一双跑步鞋",
+    "gold": ["p_clothes_007", "p_clothes_008", "p_clothes_009"]
+  },
+  {
+    "id": "q07",
+    "intent": "category_recommend",
+    "query": "无糖饮料有什么推荐",
+    "gold": ["p_food_003", "p_food_004", "p_food_015"]
+  },
+  {
+    "id": "q08",
+    "intent": "category_recommend",
+    "query": "便宜实惠的洁面乳",
+    "gold": ["p_beauty_011"]
+  },
+  {
+    "id": "q09",
+    "intent": "price_filter",
+    "query": "300元以下的防晒霜",
+    "gold": ["p_beauty_006", "p_beauty_023", "p_beauty_010"]
+  },
+  {
+    "id": "q10",
+    "intent": "price_filter",
+    "query": "2000元以下的真无线耳机",
+    "gold": ["p_digital_007", "p_digital_018"]
+  },
+  {
+    "id": "q11",
+    "intent": "price_filter",
+    "query": "7000元以下的轻薄笔记本",
+    "gold": ["p_digital_004", "p_digital_023"]
+  },
+  {
+    "id": "q12",
+    "intent": "price_filter",
+    "query": "200元以内的运动T恤",
+    "gold": ["p_clothes_001", "p_clothes_003", "p_clothes_020"]
+  },
+  {
+    "id": "q13",
+    "intent": "price_filter",
+    "query": "100元以内的休闲零食",
+    "gold": ["p_food_009", "p_food_010"]
+  },
+  {
+    "id": "q14",
+    "intent": "brand_exclude",
+    "query": "非 Apple 品牌的轻薄笔记本",
+    "gold": ["p_digital_004", "p_digital_022", "p_digital_023"]
+  },
+  {
+    "id": "q15",
+    "intent": "brand_exclude",
+    "query": "不是耐克的专业跑鞋",
+    "gold": ["p_clothes_008", "p_clothes_009", "p_clothes_010"]
+  },
+  {
+    "id": "q16",
+    "intent": "brand_exclude",
+    "query": "国产旗舰手机推荐",
+    "gold": ["p_digital_002", "p_digital_008", "p_digital_014"]
+  },
+  {
+    "id": "q17",
+    "intent": "brand_exclude",
+    "query": "不要可口可乐，有别的碳酸饮料吗",
+    "gold": ["p_food_004", "p_food_024"]
+  },
+  {
+    "id": "q18",
+    "intent": "scenario",
+    "query": "夜跑装备，要轻便透气",
+    "gold": ["p_clothes_020", "p_clothes_021", "p_clothes_007"]
+  },
+  {
+    "id": "q19",
+    "intent": "scenario",
+    "query": "适合户外徒步的鞋",
+    "gold": ["p_clothes_014", "p_clothes_015"]
+  },
+  {
+    "id": "q20",
+    "intent": "scenario",
+    "query": "打篮球穿的实战篮球鞋",
+    "gold": ["p_clothes_011", "p_clothes_012", "p_clothes_013"]
+  },
+  {
+    "id": "q21",
+    "intent": "scenario",
+    "query": "熬夜后修护肌肤的夜间精华",
+    "gold": ["p_beauty_001", "p_beauty_004"]
+  },
+  {
+    "id": "q22",
+    "intent": "scenario",
+    "query": "夏天补充能量的运动饮料",
+    "gold": ["p_food_005", "p_food_006"]
+  },
+  {
+    "id": "q23",
+    "intent": "scenario",
+    "query": "适合日常通勤的双肩背包",
+    "gold": ["p_clothes_018", "p_clothes_025"]
+  },
+  {
+    "id": "q24",
+    "intent": "scenario",
+    "query": "送女朋友的彩妆礼物",
+    "gold": ["p_beauty_014", "p_beauty_015", "p_beauty_025"]
+  },
+  {
+    "id": "q25",
+    "intent": "scenario",
+    "query": "瑜伽穿的高腰紧身裤",
+    "gold": ["p_clothes_016"]
+  }
+]
