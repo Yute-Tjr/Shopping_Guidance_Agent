@@ -50,7 +50,9 @@ def test_single_card_in_fence_emitted_once():
     visible, cards = _drain(ext, [text])
     assert "product_cards" not in visible
     assert "p_beauty_001" not in visible
-    assert visible == "为你推荐一款洗面奶：\n\n如需更多请告诉我。"
+    # 围栏前的 \n 被 rstrip；围栏闭合后的 "\n如需..." 属正文新段保留；
+    # 文末无 trailing 空白
+    assert visible == "为你推荐一款洗面奶：\n如需更多请告诉我。"
     assert len(cards) == 1
     assert cards[0]["product_id"] == "p_beauty_001"
     assert cards[0]["reason"] == "温和控油"
@@ -149,9 +151,62 @@ def test_unclosed_fence_dropped_silently():
     )
     visible, cards = _drain(ext, [text])
     assert cards == []
-    assert visible == "推荐：\n"
+    # 围栏命中时 rstrip 了围栏前文本，"推荐：\n" → "推荐："
+    assert visible == "推荐："
     assert "未闭合" not in visible
     assert "product_id" not in visible
+
+
+def test_trailing_whitespace_before_fence_stripped():
+    """LLM 正文常以 \\n\\n 收尾后接 ```product_cards 围栏；
+    可见文本不能带这两个换行，否则客户端气泡末尾会撑出空白格子。"""
+    ext = ProductCardExtractor(allowed_ids=ALLOWED)
+    text = (
+        "推荐这款。\n\n"
+        "```product_cards\n"
+        '[{"product_id":"p_beauty_001","reason":"ok"}]\n'
+        "```"
+    )
+    visible, cards = _drain(ext, [text])
+    assert visible == "推荐这款。"
+    assert len(cards) == 1
+
+
+def test_mid_text_newlines_preserved():
+    """段落中间的换行是正文一部分，绝不能被误吃。"""
+    ext = ProductCardExtractor(allowed_ids=ALLOWED)
+    text = (
+        "第一行\n"
+        "第二行\n\n"
+        "第三行。\n\n"
+        "```product_cards\n[{\"product_id\":\"p_beauty_001\",\"reason\":\"r\"}]\n```"
+    )
+    visible, _ = _drain(ext, [text])
+    assert visible == "第一行\n第二行\n\n第三行。"
+
+
+def test_no_fence_trailing_whitespace_dropped_on_finalize():
+    """没有围栏的纯文本，末尾空白在 finalize 时丢弃（文末空白无语义）。"""
+    ext = ProductCardExtractor(allowed_ids=ALLOWED)
+    visible, _ = _drain(ext, ["你好，\n", "今天天气真好。\n\n"])
+    assert visible == "你好，\n今天天气真好。"
+
+
+def test_streamed_trailing_whitespace_then_fence_token_split():
+    """流式场景：尾换行和围栏 marker 分多次 feed 来，仍要剪掉空白。"""
+    ext = ProductCardExtractor(allowed_ids=ALLOWED)
+    chunks = [
+        "推荐这款",
+        "。",
+        "\n",
+        "\n",
+        "```product_cards\n",
+        '[{"product_id":"p_beauty_001","reason":"ok"}]',
+        "\n```",
+    ]
+    visible, cards = _drain(ext, chunks)
+    assert visible == "推荐这款。"
+    assert len(cards) == 1
 
 
 def test_missing_product_id_skipped():

@@ -55,7 +55,8 @@ class ProductCardExtractor:
     def finalize(self) -> tuple[str, list[dict]]:
         """流结束时调用一次。
 
-        - NORMAL：把残留 buffer 整段吐出（此时已经不可能是 fence 前缀）。
+        - NORMAL：把残留 buffer 吐出，并 rstrip 文末空白（文末换行无语义，
+          留着会让客户端气泡末尾撑出空白格子）。
         - IN_FENCE：围栏未闭合，整段丢弃，绝不当正文吐——LLM 中途截断时
           残缺的 product_cards JSON 流给用户会被截图当"AI 编造商品"。
         """
@@ -63,7 +64,7 @@ class ProductCardExtractor:
             self._fence_buffer = ""
             self._in_fence = False
             return "", []
-        out = self._buffer
+        out = self._buffer.rstrip()
         self._buffer = ""
         return out, []
 
@@ -90,9 +91,10 @@ class ProductCardExtractor:
         self._buffer += chunk
         open_idx = self._buffer.find(FENCE_OPEN)
         if open_idx != -1:
-            # 把围栏前的文本吐出去；
-            # 紧跟开口 marker 的换行不算正文（visually 是一段空行），吃掉一个 \n。
-            visible.append(self._buffer[:open_idx])
+            # 把围栏前的文本吐出去；rstrip 掉紧贴围栏的尾换行——LLM 一般用
+            # "\n\n```product_cards" 分段，这两个换行渲染到 SwiftUI Text 里
+            # 会撑出空白行，没有视觉意义。
+            visible.append(self._buffer[:open_idx].rstrip())
             after = self._buffer[open_idx + len(FENCE_OPEN):]
             if after.startswith("\r\n"):
                 after = after[2:]
@@ -104,8 +106,14 @@ class ProductCardExtractor:
                 self._process(after, visible, cards)
             return
 
-        # 没找到 marker：可以安全吐出的部分 = buffer 去掉「可能是 fence 前缀」的尾巴
+        # 没找到 marker：可以安全吐出的部分 = buffer 去掉「可能是 fence 前缀」的尾巴。
+        # 额外把紧贴尾巴的空白也 hold 住——可能这堆空白后面就是 fence 开口；
+        # 等下一个非空字符或 fence 真出现时再决定怎么处理（fence 命中走 rstrip 分支，
+        # 非空字符出现说明这段空白是正文中间，整体 emit）。
         hold = self._suffix_overlap_with(FENCE_OPEN)
+        # 把 buffer 尾部连续空白也算入 hold
+        while hold < len(self._buffer) and self._buffer[len(self._buffer) - 1 - hold].isspace():
+            hold += 1
         emit_end = len(self._buffer) - hold
         if emit_end > 0:
             visible.append(self._buffer[:emit_end])
