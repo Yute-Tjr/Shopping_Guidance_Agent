@@ -65,7 +65,7 @@ cd ./client
 - [x] **Phase 0**：环境与脚手架
 - [x] **Phase 1**：数据工程与向量索引 ([详情](#phase-1-数据工程与向量索引)，[评测报告](docs/phase1_eval_report.md))
 - [x] **Phase 2**：后端最小闭环 ([详情](#phase-2-后端最小闭环))
-- [ ] Phase 3：iOS 客户端最小闭环
+- [x] **Phase 3**：iOS 客户端最小闭环 ([详情](#phase-3-ios-客户端最小闭环))
 - [ ] Phase 4：对话能力增强（多轮 / 反选 / 对比）
 - [ ] Phase 5：加分项（业务闭环 / 多模态 / 性能）
 - [ ] Phase 6：打磨与交付
@@ -300,6 +300,89 @@ bash scripts/smoke_chat.sh "200 元以下的蓝牙耳机有哪些？"      # 自
 
 # 5. 商品详情
 curl -s http://127.0.0.1:8000/api/v1/products/p_beauty_011 | python3 -m json.tool
+```
+
+---
+
+## Phase 3 iOS 客户端最小闭环
+
+SwiftUI + URLSession 自实现 SSE 长连接，端到端跑通"输入 → 流式回复 → 商品卡片 → 详情页"。
+
+<p align="center">
+  <img src="docs/assets/phase3_chat_demo.png" width="320" alt="iOS 模拟器端到端验收截图" />
+</p>
+
+### (a) 模块分层
+
+| 文件 | 实现 |
+| --- | --- |
+| [`client/ShoppingGuide/Models/`](client/ShoppingGuide/Models/) | `ChatMessage` / `ProductCard` / `SSEEvent` enum / `ClarifyPayload`；与后端 `app/schemas/chat.py` 字段对齐，统一走 `JSONDecoder.keyDecodingStrategy = .convertFromSnakeCase` |
+| [`client/ShoppingGuide/Networking/SSEParser.swift`](client/ShoppingGuide/Networking/SSEParser.swift) | 按 W3C SSE spec 解析 `event:` / `data:` 行 → `SSEEvent`；归一化 `\r\n` / `\r` 换行（关键坑：Swift 把 `\r\n` 当成一个 grapheme cluster，直接 split 拆不开） |
+| [`client/ShoppingGuide/Networking/StreamingClient.swift`](client/ShoppingGuide/Networking/StreamingClient.swift) | `URLSession + URLSessionDataDelegate` 自实现 SSE 长连接；缓冲区同时识别 `\r\n\r\n` / `\n\n` 帧分隔；解析到 `done` 主动 finish，否则等 `didCompleteWithError`；`onTermination` 强引用 self 防止 transport 创建后立即释放 |
+| [`client/ShoppingGuide/Networking/APIClient.swift`](client/ShoppingGuide/Networking/APIClient.swift) | `buildChatStreamRequest`（POST + `Accept: text/event-stream`）+ `fetchProductDetail` GET 异步；`ProductDetail` Codable 模型 |
+| [`client/ShoppingGuide/Features/Chat/ChatTransport.swift`](client/ShoppingGuide/Features/Chat/ChatTransport.swift) | `ChatTransport` protocol 把 ViewModel 与具体 SSE 实现解耦；`LiveChatTransport` 走真实 APIClient，`FakeChatTransport` 给测试喂事件数组 |
+| [`client/ShoppingGuide/Features/Chat/ChatViewModel.swift`](client/ShoppingGuide/Features/Chat/ChatViewModel.swift) | `@MainActor ObservableObject`：token → 累加 `text`、productCard → 追加 `productCards`、clarify → 写入 `clarify`、error → 挂 `errorNotice`、done → `isStreaming = false`；session_id 多轮复用 |
+| [`client/ShoppingGuide/Features/Chat/ChatView.swift`](client/ShoppingGuide/Features/Chat/ChatView.swift) | 主页：输入栏 + ScrollView + ScrollViewReader 流式自动滚底；DEBUG 编译时检测 `-autoSendDemo "<query>"` launch arg 自动发一条，方便命令行端到端 smoke |
+| [`client/ShoppingGuide/Features/Chat/MessageBubble.swift`](client/ShoppingGuide/Features/Chat/MessageBubble.swift) | 单条气泡：用户右对齐蓝底 / Assistant 左对齐灰底；流式时末尾接 `▍` 光标；clarify 渲染 chip 按钮组 |
+| [`client/ShoppingGuide/Features/Product/ProductCardView.swift`](client/ShoppingGuide/Features/Product/ProductCardView.swift) | 80x80 主图 + 品牌 / 类目 / 标题 / 价格区间 / SKU 数 / reason；整张卡片包 `NavigationLink` push 详情 |
+| [`client/ShoppingGuide/Features/Product/ProductDetailView.swift`](client/ShoppingGuide/Features/Product/ProductDetailView.swift) | 详情页：进入 `task` 调 `GET /api/v1/products/{id}`，渲染主图 + 标题 + 全部 SKU 列表 |
+
+### (b) 测试覆盖
+
+[`client/Package.swift`](client/Package.swift) 是独立 SwiftPM 包，与 Xcode 工程**共用** `ShoppingGuide/` 下源文件（不复制不分叉），用 `swift test` 在 macOS 上跑客户端逻辑层单测。
+
+```
+client/Tests/ShoppingGuideKitTests/
+├── SSEParserTests.swift     12 用例（token/session/status/product_card/clarify/error/done、CRLF 帧、心跳注释、坏 JSON、未知事件、event/data 任意顺序）
+└── ChatViewModelTests.swift  6 用例（happy path 累加 token + 卡片、clarify、error 不中断、空输入忽略、status 不污染正文、session_id 跨轮保留）
+```
+
+合计 **18 用例全部绿**，命令行直接跑：
+
+```bash
+cd client
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+```
+
+### (c) Phase 3 验收实测（iPhone 17 模拟器）
+
+后端起来后跑 `xcrun simctl launch <udid> com.yute.ShoppingGuide -autoSendDemo "推荐一款适合油皮的洗面奶"`，UI 实际表现：
+
+1. 用户气泡：`推荐一款适合油皮的洗面奶`
+2. Assistant 气泡逐字流出：「给你推荐珊珂的这款洁面乳。泡沫绵密清洁力足，洗完清爽不紧绷，适配油皮清洁需求，性价比很高。」
+3. 文字下方插入卡片：`p_beauty_011`（珊珂洗颜专科绵润泡沫洁面乳 120g），价格 ¥52.00 - ¥69.00，2 种规格，reason"泡沫绵密洗后不紧绷，适配油皮清洁"
+4. 主图通过 `/static/1_美妆护肤/images/p_beauty_011_live.jpg` 异步加载到位
+5. 点击卡片可 push 进 ProductDetailView 查看完整 SKU
+
+`p_beauty_011` 真实存在于 MySQL；卡片的标题 / 品牌 / 价格 / 图片 URL 全部由 [`app/db/product_repo.py`](server/app/db/product_repo.py) 从 MySQL hydrate，LLM 不参与生成——满足课题"严禁幻觉"硬约束。
+
+### Phase 3 复跑指令
+
+前置：Xcode 16+（用 `PBXFileSystemSynchronizedRootGroup` 自动同步 `ShoppingGuide/` 整目录）。详细 Xcode 工程初始化步骤见 [`client/README.md`](client/README.md)。
+
+```bash
+# 1. 后端先起来
+cd server && source .venv/bin/activate
+uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+
+# 2. 客户端单测（macOS 上离线跑，~1s）
+cd ../client
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+
+# 3. iOS 模拟器手动跑：Xcode 打开 client/ShoppingGuide.xcodeproj，选 iPhone 17 模拟器 → Cmd+R
+
+# 4. 命令行 e2e smoke（一键起 sim + 自动发一条验收 query）
+DEV=/Applications/Xcode.app/Contents/Developer
+UDID=$($DEV/usr/bin/xcrun simctl list devices available | grep "iPhone 17 " | head -1 | grep -oE "[0-9A-F-]{36}")
+DEVELOPER_DIR=$DEV xcrun simctl boot "$UDID" 2>/dev/null
+DEVELOPER_DIR=$DEV xcodebuild -project client/ShoppingGuide.xcodeproj -scheme ShoppingGuide \
+  -destination "platform=iOS Simulator,name=iPhone 17" -configuration Debug build
+APP=$(find ~/Library/Developer/Xcode/DerivedData -name ShoppingGuide.app -path "*Debug-iphonesimulator*" | head -1)
+DEVELOPER_DIR=$DEV xcrun simctl install "$UDID" "$APP"
+DEVELOPER_DIR=$DEV xcrun simctl launch "$UDID" com.yute.ShoppingGuide \
+  -autoSendDemo "推荐一款适合油皮的洗面奶"
+DEVELOPER_DIR=$DEV xcrun simctl io "$UDID" screenshot /tmp/phase3.png
+open /tmp/phase3.png
 ```
 
 ---

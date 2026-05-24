@@ -146,7 +146,72 @@ git commit -m "client: bootstrap Xcode project for Phase 0"
 `.xcodeproj` 内的 `xcuserdata/` 是个人偏好（编辑器折叠、scheme 选择等），仓库
 顶层 `.gitignore` 已统一忽略，无需在 client/ 下额外配置。
 
-> 待 Phase 3 开始时再补 SPM 依赖：`MarkdownUI`、`Kingfisher`。
+> Phase 3 最小闭环未引入 SPM 依赖，文字气泡用 SwiftUI 自带 `Text`，远程图片走 `AsyncImage`。`MarkdownUI` / `Kingfisher` 留到 Phase 5 富文本 / 性能打磨阶段再加。
+
+## Phase 3 验收：流式聊天 + 商品卡片
+
+Phase 3 已在 `client/ShoppingGuide/` 下落地：
+
+```
+ShoppingGuide/
+├── App/
+│   ├── ShoppingGuideApp.swift     # @main → NavigationStack { ChatView(env:) }
+│   └── AppEnvironment.swift
+├── Models/                         # ChatMessage / ProductCard / SSEEvent / ClarifyPayload
+├── Networking/                     # APIClient / StreamingClient / SSEParser / Endpoints
+└── Features/
+    ├── Chat/                       # ChatView / ChatViewModel / ChatTransport / MessageBubble
+    └── Product/                    # ProductCardView / ProductDetailView
+```
+
+平级新增了 `client/Package.swift`，是独立 SwiftPM 包，**共用** `ShoppingGuide/` 下源文件（不复制不分叉），用来在 macOS 上跑客户端逻辑层单测；测试代码在 `client/Tests/ShoppingGuideKitTests/`。Xcode 工程通过 `PBXFileSystemSynchronizedRootGroup` 自动同步整个 `ShoppingGuide/` 目录，不需要手动 Add Files。
+
+### 模拟器跑通
+
+```bash
+# 1. 后端起来（另一个窗口）
+cd ../server && source .venv/bin/activate
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# 2. Xcode 打开，选 iPhone 17 模拟器，Cmd+R
+open ShoppingGuide.xcodeproj
+```
+
+输入"推荐一款适合油皮的洗面奶" → 看到逐字流式回复 + 商品卡片（带主图 / 价格 / 规格）→ 点击卡片 push 详情页。
+
+### 命令行端到端 smoke
+
+`ChatView` 在 DEBUG 编译时检测 launch arg `-autoSendDemo "<query>"`，可一键复现验收路径：
+
+```bash
+DEV=/Applications/Xcode.app/Contents/Developer
+UDID=$($DEV/usr/bin/xcrun simctl list devices available \
+       | grep "iPhone 17 " | head -1 | grep -oE "[0-9A-F-]{36}")
+DEVELOPER_DIR=$DEV xcrun simctl boot "$UDID" 2>/dev/null
+DEVELOPER_DIR=$DEV xcodebuild -project ShoppingGuide.xcodeproj -scheme ShoppingGuide \
+  -destination "platform=iOS Simulator,name=iPhone 17" -configuration Debug build
+APP=$(find ~/Library/Developer/Xcode/DerivedData -name ShoppingGuide.app -path "*Debug-iphonesimulator*" | head -1)
+DEVELOPER_DIR=$DEV xcrun simctl install "$UDID" "$APP"
+DEVELOPER_DIR=$DEV xcrun simctl launch "$UDID" com.yute.ShoppingGuide \
+  -autoSendDemo "推荐一款适合油皮的洗面奶"
+sleep 15
+DEVELOPER_DIR=$DEV xcrun simctl io "$UDID" screenshot /tmp/phase3.png && open /tmp/phase3.png
+```
+
+### 单测（不用 Xcode UI 也能跑）
+
+```bash
+cd "$(git rev-parse --show-toplevel)/client"
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
+# 期望：18 用例全过（SSEParser × 12 + ChatViewModel × 6）
+```
+
+### Phase 3 踩到的坑
+
+1. **`\r\n` 被 Swift 当成单个 grapheme cluster**：sse-starlette 用 `\r\n` 作行尾，`String.split(separator: "\n")` 直接拆不开（grapheme cluster 不会被中间断开）。修复：parser 先 `replacingOccurrences("\r\n" → "\n")` 归一化，再 split。
+2. **`StreamingClient` 立即被释放**：`LiveChatTransport.stream` 里 `let client = StreamingClient(); return client.stream(...)`，client 是局部变量，return 后没人持有，URLSession 跟着失效，delegate 永远不会被回调。修复：`AsyncStream` 的 `onTermination` 闭包**强引用** self（不用 `[weak self]`），让生命周期延到流结束。
+3. **SSE 帧分隔可能是 `\r\n\r\n` 或 `\n\n`**：StreamingClient 缓冲区扫描时两种都试，谁先出现先切谁。
+4. **`JSONDecoder.keyDecodingStrategy = .convertFromSnakeCase` 对 `[String: String]` 不生效**：只在 Codable 结构体解码时把 `session_id` 转成 `sessionId`；用 dict 接收时仍是原 `session_id` 键。修复：解事件层面用字典时直接读 snake_case。
 
 ## 目录索引（Phase 0 已就位）
 
