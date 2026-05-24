@@ -84,8 +84,9 @@ struct ChatView: View {
                 Text("PriceCat")
                     .font(Theme.Typo.brandWordmark)
                     .foregroundStyle(Theme.Palette.textPrimary)
-                Text("AI 比价导购")
-                    .font(Theme.Typo.caption())
+                    .tracking(0.5)
+                Text("a daily companion for considered buying")
+                    .font(Theme.Typo.caption().italic())
                     .foregroundStyle(Theme.Palette.textSecondary)
             }
 
@@ -164,13 +165,15 @@ struct ChatView: View {
                     )
             }
 
-            VStack(spacing: 6) {
-                Text("喵～想买点什么？")
+            VStack(spacing: 8) {
+                Text("今天想买什么？")
                     .font(Theme.Typo.display())
                     .foregroundStyle(Theme.Palette.textPrimary)
-                Text("PriceCat 帮你从 100 款真实商品里挑")
-                    .font(Theme.Typo.caption())
+                Text("Ask anything — I'll pick from real listings, never invented.")
+                    .font(Theme.Typo.caption().italic())
                     .foregroundStyle(Theme.Palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, Theme.Spacing.l)
             }
 
             VStack(spacing: Theme.Spacing.s) {

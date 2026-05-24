@@ -41,25 +41,31 @@ enum Theme {
 
     // MARK: - Typography
 
-    /// 全局沿用 SF Rounded —— 友好商业感，且系统字体免引入依赖。
+    /// 全局走 .serif → iOS 系统会映射到 **New York**（Apple 自家衬线，质感对标
+    /// Claude.ai 用的 Tiempos Text）。配合品牌橙与浅橙底，整页 editorial / 杂志感，
+    /// 主动远离常见 AI 应用的 sans-serif "AI slop"。
     enum Typo {
-        static func display(_ weight: Font.Weight = .bold) -> Font {
-            .system(size: 22, weight: weight, design: .rounded)
+        static func display(_ weight: Font.Weight = .semibold) -> Font {
+            .system(size: 24, weight: weight, design: .serif)
         }
         static func title(_ weight: Font.Weight = .semibold) -> Font {
-            .system(size: 17, weight: weight, design: .rounded)
+            .system(size: 18, weight: weight, design: .serif)
         }
         static func body(_ weight: Font.Weight = .regular) -> Font {
-            .system(size: 15, weight: weight, design: .rounded)
+            .system(size: 16, weight: weight, design: .serif)
         }
-        static func caption(_ weight: Font.Weight = .medium) -> Font {
-            .system(size: 12, weight: weight, design: .rounded)
+        static func caption(_ weight: Font.Weight = .regular) -> Font {
+            .system(size: 12, weight: weight, design: .serif)
         }
-        /// 商品价格强调
-        static let priceLg = Font.system(size: 20, weight: .heavy, design: .rounded)
-        static let priceMd = Font.system(size: 15, weight: .bold, design: .rounded)
-        /// 品牌名 / 顶部导航
-        static let brandWordmark = Font.system(size: 19, weight: .heavy, design: .rounded)
+        /// 商品价格强调 —— 衬线 bold 显得克制有教养
+        static let priceLg = Font.system(size: 22, weight: .bold, design: .serif)
+        static let priceMd = Font.system(size: 16, weight: .semibold, design: .serif)
+        /// 品牌 wordmark —— italic semibold，杂志刊头风
+        static let brandWordmark = Font.system(size: 22, weight: .semibold, design: .serif).italic()
+        /// 表头 —— 表格用，比 body 略小但加粗
+        static let tableHeader = Font.system(size: 14, weight: .semibold, design: .serif)
+        /// 表格单元格
+        static let tableCell = Font.system(size: 14, weight: .regular, design: .serif)
     }
 
     // MARK: - Radii / Spacing / Shadows

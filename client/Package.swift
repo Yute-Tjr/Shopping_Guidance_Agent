@@ -32,13 +32,15 @@ let package = Package(
                 "Features/Chat/ClarifyChipsView.swift",
                 "Features/Product/ProductCardView.swift",
                 "Features/Product/ProductDetailView.swift",
-                "Components",
-                "Resources",
+                "Components/MarkdownView.swift",
+                "Resources/Assets.xcassets",
             ],
             sources: [
                 "Models",
                 "Networking",
                 "Features/Chat",
+                "Components",       // MarkdownParser 纯逻辑可测
+                "Resources",         // Theme.swift
             ]
         ),
         .testTarget(

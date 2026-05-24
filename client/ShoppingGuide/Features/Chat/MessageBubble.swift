@@ -45,23 +45,23 @@ struct MessageBubble: View {
     @ViewBuilder
     private var bubbleContent: some View {
         let isUser = message.role == .user
-        // 不要给 Text 加 .frame(maxWidth: .infinity)！它会把气泡背景拉满，
-        // 这是历史 bug。改用 .fixedSize 让气泡按文字自然换行后的实际尺寸。
-        //
-        // 同时 trim 末尾空白：服务端 LLM 正文常以 \n\n 收尾再接 ```product_cards
-        // 围栏，ProductCardExtractor 只吃掉了开口围栏后面的换行，前面的 \n\n
-        // 会作为可见 token 流过来；Text 渲染两个尾换行 = 两行空白灰格子。
+        // Trim 末尾空白：后端虽已 rstrip，留这里做展示层 fallback。
         let displayText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        HStack(alignment: .bottom, spacing: 6) {
+
+        // 用户气泡用纯 Text（用户输入不需 markdown 渲染）；assistant 走 MarkdownView 支持表格。
+        VStack(alignment: .leading, spacing: 6) {
             if !displayText.isEmpty {
-                Text(displayText)
-                    .font(Theme.Typo.body())
-                    .foregroundStyle(isUser ? Theme.Palette.onBrand : Theme.Palette.textPrimary)
-                    .fixedSize(horizontal: false, vertical: true)
+                if isUser {
+                    Text(displayText)
+                        .font(Theme.Typo.body())
+                        .foregroundStyle(Theme.Palette.onBrand)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    MarkdownView(text: displayText, textColor: Theme.Palette.textPrimary)
+                }
             }
             if message.isStreaming {
                 StreamingDot(color: isUser ? Theme.Palette.onBrand : Theme.Palette.brand)
-                    .padding(.bottom, 4)
             }
         }
         .padding(.horizontal, 14)

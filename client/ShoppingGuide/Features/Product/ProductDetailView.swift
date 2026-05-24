@@ -84,7 +84,7 @@ struct ProductDetailView: View {
         let maxP = prices.max() ?? detail.basePrice
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Text(priceFormatted(minP))
-                .font(.system(size: 28, weight: .heavy, design: .rounded))
+                .font(.system(size: 30, weight: .bold, design: .serif))
                 .foregroundStyle(Theme.Palette.priceHot)
             if maxP > minP {
                 Text("起 · 最高 \(priceFormatted(maxP))")
