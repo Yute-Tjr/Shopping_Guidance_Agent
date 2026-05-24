@@ -47,9 +47,14 @@ struct MessageBubble: View {
         let isUser = message.role == .user
         // 不要给 Text 加 .frame(maxWidth: .infinity)！它会把气泡背景拉满，
         // 这是历史 bug。改用 .fixedSize 让气泡按文字自然换行后的实际尺寸。
+        //
+        // 同时 trim 末尾空白：服务端 LLM 正文常以 \n\n 收尾再接 ```product_cards
+        // 围栏，ProductCardExtractor 只吃掉了开口围栏后面的换行，前面的 \n\n
+        // 会作为可见 token 流过来；Text 渲染两个尾换行 = 两行空白灰格子。
+        let displayText = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
         HStack(alignment: .bottom, spacing: 6) {
-            if !message.text.isEmpty {
-                Text(message.text)
+            if !displayText.isEmpty {
+                Text(displayText)
                     .font(Theme.Typo.body())
                     .foregroundStyle(isUser ? Theme.Palette.onBrand : Theme.Palette.textPrimary)
                     .fixedSize(horizontal: false, vertical: true)
