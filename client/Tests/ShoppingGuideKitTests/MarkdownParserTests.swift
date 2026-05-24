@@ -68,14 +68,43 @@ struct MarkdownParserTests {
         #expect(rows == [["1", "2"]])
     }
 
-    @Test func missingSeparatorTreatedAsParagraph() {
-        // 缺少 | --- | --- | 分隔行：不当表格，回退成多段段落
+    @Test func missingSeparatorButPipeRowsStillTreatedAsTable() {
+        // LLM 经常忘写 `| --- | --- |` 分隔行；只要管道行 ≥ 2 且列数一致，
+        // parser 宽松地把第一行当 header 处理（防御性 UX，不让用户看到原始管道）。
         let md = """
         | A | B |
         | 1 | 2 |
         """
         let blocks = MarkdownParser.parse(md)
-        if case .table = blocks[0] { Issue.record("should not be a table without separator") }
+        guard case let .table(headers, rows) = blocks[0] else { Issue.record("expected table"); return }
+        #expect(headers == ["A", "B"])
+        #expect(rows == [["1", "2"]])
+    }
+
+    @Test func paragraphAndTableSeparatedBySingleNewline() {
+        // 真实 LLM 输出场景：引导段 + \n + 表格，中间没有空行
+        let md = """
+        我整理了两款精华的对比：
+        | 商品 | 价格 |
+        | --- | --- |
+        | A | ¥99 |
+        总结：选 A。
+        """
+        let blocks = MarkdownParser.parse(md)
+        #expect(blocks.count == 3)
+        if case let .paragraph(p) = blocks[0] { #expect(String(p.characters) == "我整理了两款精华的对比：") } else { Issue.record("0 not paragraph") }
+        if case let .table(h, r) = blocks[1] {
+            #expect(h == ["商品", "价格"])
+            #expect(r == [["A", "¥99"]])
+        } else { Issue.record("1 not table") }
+        if case let .paragraph(p) = blocks[2] { #expect(String(p.characters) == "总结：选 A。") } else { Issue.record("2 not paragraph") }
+    }
+
+    @Test func singlePipeLineStaysParagraph() {
+        // 单行带管道不是表格，免得把"小贴士 | 注意事项"当表格头
+        let md = "提示 | 注意事项"
+        let blocks = MarkdownParser.parse(md)
+        if case .table = blocks[0] { Issue.record("single line should stay paragraph") }
     }
 
     @Test func unclosedTableRowDoesNotCrash() {

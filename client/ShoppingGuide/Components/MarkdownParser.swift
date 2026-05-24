@@ -22,25 +22,65 @@ public enum MarkdownParser {
     public static func parse(_ text: String) -> [MarkdownBlock] {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
 
-        // 1. 归一化换行
+        // 归一化换行
         let normalized = text
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
 
-        // 2. 切成按空行分隔的"块"
-        let rawBlocks = normalized
-            .components(separatedBy: "\n\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
+        // **行级扫描**：LLM 经常把段落和表格只用单 \n 连起来（不是 GFM 标准的
+        // 空行分隔），如果按 \n\n 切块就识别不到。这里改成边走边切换状态。
+        let lines = normalized.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { String($0) }
 
         var out: [MarkdownBlock] = []
-        for raw in rawBlocks {
-            if let table = parseTable(raw) {
-                out.append(table)
-            } else {
-                out.append(.paragraph(parseInline(raw)))
+        var paragraphBuffer: [String] = []
+        var i = 0
+
+        func flushParagraphs() {
+            // 把累积的段落行按空行切成多段
+            let joined = paragraphBuffer.joined(separator: "\n")
+            for part in joined.components(separatedBy: "\n\n") {
+                let trimmed = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    out.append(.paragraph(parseInline(trimmed)))
+                }
             }
+            paragraphBuffer.removeAll()
         }
+
+        while i < lines.count {
+            let line = lines[i]
+            // 检测表格起点：当前是表格行 + 下一行也是表格行（且列数一致 / 或下一行是分隔符）
+            if isTableRow(line) && i + 1 < lines.count {
+                let next = lines[i + 1]
+                let isStrict = isSeparatorRow(next)
+                let headerCells = splitTableRow(line)
+                let nextCells = splitTableRow(next)
+                let sameWidth = !isStrict && isTableRow(next)
+                    && headerCells.count > 0 && headerCells.count == nextCells.count
+                if isStrict || sameWidth {
+                    // 收集连续表格行（含 header / separator / data）
+                    flushParagraphs()
+                    var tableLines: [String] = [line]
+                    var j = i + 1
+                    while j < lines.count, isTableRow(lines[j]) {
+                        tableLines.append(lines[j])
+                        j += 1
+                    }
+                    if let block = parseTable(tableLines.joined(separator: "\n")) {
+                        out.append(block)
+                    } else {
+                        // 极端 fallback：当段落
+                        paragraphBuffer.append(contentsOf: tableLines)
+                    }
+                    i = j
+                    continue
+                }
+            }
+            paragraphBuffer.append(line)
+            i += 1
+        }
+        flushParagraphs()
         return out
     }
 
@@ -49,19 +89,31 @@ public enum MarkdownParser {
     private static func parseTable(_ raw: String) -> MarkdownBlock? {
         let lines = raw.split(separator: "\n", omittingEmptySubsequences: false).map { String($0) }
         guard lines.count >= 2 else { return nil }
-        // 至少前两行：header + separator
+        // 第 0 行必须看起来像表格行（包含 |）
         guard isTableRow(lines[0]) else { return nil }
-        guard isSeparatorRow(lines[1]) else { return nil }
+
+        // 优先严格模式：第 1 行是 `| --- | --- |` 分隔行（GFM 标准）
+        let strictMode = isSeparatorRow(lines[1])
+
+        // 宽松模式：LLM 经常忘写分隔行。只要后续至少还有 1 行同样是表格行
+        // 且列数一致，就当表格处理（header = 第 0 行）。
+        if !strictMode {
+            guard isTableRow(lines[1]) else { return nil }
+            let h = splitTableRow(lines[0]).count
+            let r = splitTableRow(lines[1]).count
+            guard h > 0 && h == r else { return nil }
+        }
 
         let headers = splitTableRow(lines[0])
         let columnCount = headers.count
         guard columnCount > 0 else { return nil }
 
+        let dataStartIdx = strictMode ? 2 : 1
         var rows: [[String]] = []
-        for line in lines.dropFirst(2) {
+        for line in lines.dropFirst(dataStartIdx) {
             guard isTableRow(line) else { continue }
+            // 宽松模式下要排除"误把另一段管道行当数据"的情况，但列数不匹配也保留补齐
             var cells = splitTableRow(line)
-            // 缺位补空，多余截断 —— 流式中途的半行也能稳
             if cells.count < columnCount {
                 cells.append(contentsOf: Array(repeating: "", count: columnCount - cells.count))
             } else if cells.count > columnCount {

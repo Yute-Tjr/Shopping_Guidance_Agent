@@ -32,7 +32,10 @@ struct MarkdownView: View {
 
 // MARK: - Table block
 
-private struct TableBlockView: View {
+/// 极简表格组件：表头浅橙底 / hairline 列&行分隔 / 杂志衢线。
+/// 文件可见性 `internal` 让 MessageBubble 可直接复用，无需通过 MarkdownView 中转，
+/// 因为长表格需要突破气泡限宽独立放置。
+struct TableBlockView: View {
     let headers: [String]
     let rows: [[String]]
 

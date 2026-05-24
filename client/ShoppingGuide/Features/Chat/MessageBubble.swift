@@ -19,7 +19,13 @@ struct MessageBubble: View {
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading,
                spacing: Theme.Spacing.s) {
-            bubbleRow
+            // Assistant 消息按 markdown 块拆开："段落组进气泡 / 表格独立全宽"，
+            // 避免长表格被气泡 minLength 限宽挤成竖排的"每字一行"。
+            if message.role == .assistant {
+                assistantContent
+            } else {
+                bubbleRow
+            }
             if !message.productCards.isEmpty {
                 cardsStack
             }
@@ -30,6 +36,95 @@ struct MessageBubble: View {
                 errorRow(notice)
             }
         }
+    }
+
+    // MARK: - Assistant content (split by markdown blocks)
+
+    @ViewBuilder
+    private var assistantContent: some View {
+        let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let blocks = MarkdownParser.parse(trimmed)
+        let segments = Self.segregate(blocks: blocks)
+
+        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+            ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                switch seg {
+                case .paragraphs(let attrs):
+                    // 同一组连续段落塞进同一个气泡，气泡 hug 内容，min 宽=不限
+                    assistantBubble(paragraphs: attrs)
+                case .table(let headers, let rows):
+                    // 表格占消息列全宽 —— 突破气泡的右侧 spacer，让内容能展开
+                    TableBlockView(headers: headers, rows: rows)
+                }
+            }
+            // 流式光标 = 没有段落或最后一块不是段落时，独立放一个
+            if message.isStreaming && !endsWithBubble(segments) {
+                StreamingDot(color: Theme.Palette.brand)
+            }
+        }
+    }
+
+    private func endsWithBubble(_ segments: [MarkdownSegment]) -> Bool {
+        if case .paragraphs = segments.last { return true }
+        return false
+    }
+
+    private func assistantBubble(paragraphs: [AttributedString]) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, p in
+                    Text(p)
+                        .font(Theme.Typo.body())
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if message.isStreaming {
+                    StreamingDot(color: Theme.Palette.brand)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
+                    .fill(Theme.Palette.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
+                    .stroke(Theme.Palette.border, lineWidth: 1)
+            )
+            .themeShadow(Theme.Shadow.card)
+            Spacer(minLength: Theme.Spacing.xl)
+        }
+    }
+
+    // MARK: - segregate
+
+    enum MarkdownSegment {
+        case paragraphs([AttributedString])
+        case table(headers: [String], rows: [[String]])
+    }
+
+    /// 把 MarkdownBlock 列表压缩为「连续段落组 + 表格」两类 segment，
+    /// 便于按视觉层级渲染：段落进同一气泡、表格独占全宽。
+    private static func segregate(blocks: [MarkdownBlock]) -> [MarkdownSegment] {
+        var out: [MarkdownSegment] = []
+        var buffer: [AttributedString] = []
+        for b in blocks {
+            switch b {
+            case .paragraph(let attr):
+                buffer.append(attr)
+            case .table(let h, let r):
+                if !buffer.isEmpty {
+                    out.append(.paragraphs(buffer))
+                    buffer.removeAll()
+                }
+                out.append(.table(headers: h, rows: r))
+            }
+        }
+        if !buffer.isEmpty {
+            out.append(.paragraphs(buffer))
+        }
+        return out
     }
 
     // MARK: - Bubble
