@@ -10,6 +10,11 @@ struct ChatView: View {
     @StateObject private var viewModel: ChatViewModel
     @FocusState private var inputFocused: Bool
 
+    /// 全局只跑一次的 e2e demo flag。SwiftUI `.task` 在 ChatView 每次重新出现时都
+    /// 会重跑（如从 ProductDetailView pop 回来），不锁住的话会把验收 query 反复发送。
+    /// 用 static 而非 @State：@State 会随 view 重建归零，static 持续整个进程生命周期。
+    private static var autoSendDemoFired = false
+
     /// 4 条预置 query。后续 Phase 4 可换成"近期热搜"或个性化推荐。
     private let starterPrompts: [String] = [
         "推荐一款适合油皮的洗面奶",
@@ -42,13 +47,15 @@ struct ChatView: View {
         .task {
             #if DEBUG
             // E2E smoke 钩子：simctl 启动时若传 -autoSendDemo "<query>"，自动发一次。
-            if let idx = CommandLine.arguments.firstIndex(of: "-autoSendDemo"),
-               CommandLine.arguments.indices.contains(idx + 1) {
-                let demo = CommandLine.arguments[idx + 1]
-                try? await Task.sleep(nanoseconds: 400_000_000)
-                viewModel.inputText = demo
-                await viewModel.send()
-            }
+            // 守 autoSendDemoFired：避免从详情页 pop 回来时 .task 重新触发再发送。
+            guard !Self.autoSendDemoFired,
+                  let idx = CommandLine.arguments.firstIndex(of: "-autoSendDemo"),
+                  CommandLine.arguments.indices.contains(idx + 1) else { return }
+            Self.autoSendDemoFired = true
+            let demo = CommandLine.arguments[idx + 1]
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            viewModel.inputText = demo
+            await viewModel.send()
             #endif
         }
     }
