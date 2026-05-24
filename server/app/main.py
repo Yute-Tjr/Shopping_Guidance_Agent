@@ -1,7 +1,7 @@
 """FastAPI 入口。
 
-Phase 0：只挂 /healthz 健康检查 + 一个根路由占位 + 全局 CORS / lifespan。
-后续 Phase 2 起逐步注册 /chat /products /cart /upload 等路由。
+- Phase 0：/healthz + 根路由 + CORS + lifespan + StaticFiles。
+- Phase 2：挂载 /api/v1/chat/stream（SSE）与 /api/v1/products/{id}。
 """
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
+from app.api.chat import router as chat_router
+from app.api.products import router as products_router
 from app.config import settings
 from app.db.mysql_session import engine
 from app.utils.logger import get_logger
@@ -55,6 +57,11 @@ if _dataset_dir.exists():
     app.mount("/static", StaticFiles(directory=str(_dataset_dir)), name="static")
 else:
     logger.warning("数据集目录不存在：%s（Phase 0 可忽略，Phase 1 灌数据前必须就位）", _dataset_dir)
+
+
+# Phase 2 路由统一挂在 /api/v1 前缀下（docs/03 §3.1）。
+app.include_router(chat_router, prefix="/api/v1")
+app.include_router(products_router, prefix="/api/v1")
 
 
 @app.get("/")

@@ -64,7 +64,7 @@ cd ./client
 
 - [x] **Phase 0**：环境与脚手架
 - [x] **Phase 1**：数据工程与向量索引 ([详情](#phase-1-数据工程与向量索引)，[评测报告](docs/phase1_eval_report.md))
-- [ ] Phase 2：后端最小闭环
+- [x] **Phase 2**：后端最小闭环 ([详情](#phase-2-后端最小闭环))
 - [ ] Phase 3：iOS 客户端最小闭环
 - [ ] Phase 4：对话能力增强（多轮 / 反选 / 对比）
 - [ ] Phase 5：加分项（业务闭环 / 多模态 / 性能）
@@ -163,6 +163,143 @@ python -m scripts.build_index --rebuild   # 全量 ~20s
 
 # 3. (c) 评测
 python -m scripts.eval_recall --output ../docs/phase1_eval_report.md
+```
+
+---
+
+## Phase 2 后端最小闭环
+
+FastAPI + SSE + Agent 编排，把 Phase 1 的向量索引串成可被 iOS 调用的实时对话接口。完整流程：
+
+```
+iOS  ── POST /api/v1/chat/stream ──▶  IntentRouter
+                                       └─▶ RagRetriever (embed → Milvus → 聚合 Top-N)
+                                              └─▶ PromptBuilder (RECOMMEND / COMPARE)
+                                                     └─▶ Doubao LLM stream
+                                                            └─▶ ProductCardExtractor
+                                                                   └─▶ MySQL hydrate
+                                                                          └─▶ SSE events
+```
+
+### (a) Agent 层
+
+| 文件 | 实现 |
+| --- | --- |
+| [`server/app/agent/intent.py`](server/app/agent/intent.py) | 规则版 IntentRouter：关键词区分 recommend / compare / cart_op / clarify_needed，省一次 LLM 调用降低首 token 延迟；Phase 4 再 fallback LLM JSON 抽取 |
+| [`server/app/agent/prompts.py`](server/app/agent/prompts.py) | 集中管理 RECOMMEND / COMPARE 两套 Prompt；硬约束 `product_id` 仅从 `<retrieved_products>` 取、找不到必须明说"抱歉未找到"、卡片协议用 ```product_cards 围栏 JSON 输出 |
+| [`server/app/agent/card_extractor.py`](server/app/agent/card_extractor.py) | 流式 token 解析器：识别 ```product_cards 围栏、跨 token 切分容错、JSON 解析、`allowed_ids` 过滤幻觉 product_id、reason 字段 ≤120 字符截断；围栏未闭合时整段丢弃绝不当正文吐 |
+| [`server/app/agent/memory.py`](server/app/agent/memory.py) | 进程内会话记忆：session_id 缺失生成 UUID，最近 6 轮 FIFO 截断，记录 `last_recommended_ids` 给 Phase 4 指代消解用 |
+| [`server/app/agent/orchestrator.py`](server/app/agent/orchestrator.py) | 主流程编排：emit session → 意图分发 → 检索 → Prompt → LLM 流式 → 卡片提取 → MySQL hydrate → emit done；LLM 异常降级到推 Top-3 检索结果作为兜底卡片 |
+
+### (b) LLM / 检索封装
+
+| 文件 | 实现 |
+| --- | --- |
+| [`server/app/llm/doubao_client.py`](server/app/llm/doubao_client.py) | `AsyncArk.chat.completions.create(stream=True)` 封装：`chat_stream(messages) → AsyncIterator[str]`，跳过空 delta / 心跳 chunk |
+| [`server/app/rag/retriever.py`](server/app/rag/retriever.py) | Phase 1 embedder + milvus_store 之上的聚合层：query → Top-K chunk → 按 product_id 去重保留最高分 → 返回 `RetrievedProduct` 列表 |
+| [`server/app/db/product_repo.py`](server/app/db/product_repo.py) | SSE 卡片 hydrate 用：`get_card_view(product_id)` 查 MySQL Products+SKUs，拼出标题 / 品牌 / image_url / price_range / SKU 列表；LLM 不允许参与任何字段填充 |
+
+### (c) API 层
+
+| 文件 | 实现 |
+| --- | --- |
+| [`server/app/api/chat.py`](server/app/api/chat.py) | `POST /api/v1/chat/stream`：sse-starlette EventSourceResponse + ping=15s 心跳；按 docs/03 §3.2 契约 emit session / status / token / product_card / clarify / error / done 七类事件 |
+| [`server/app/api/products.py`](server/app/api/products.py) | `GET /api/v1/products/{id}`：详情页用，返回完整 SKU + image_url + 原 JSON |
+| [`server/app/api/deps.py`](server/app/api/deps.py) | FastAPI 依赖注入工厂：retriever / llm / product_repo / orchestrator 全部走 `lru_cache` 单例；测试期可用 `app.dependency_overrides` 替换 fake |
+| [`server/app/schemas/`](server/app/schemas/) | `ChatRequest` + 7 类 SSE 事件 Pydantic 模型，与 iOS `JSONDecoder.keyDecodingStrategy = .convertFromSnakeCase` 对齐 |
+
+### (d) 防幻觉 5 层保险（docs/02 §7 落地）
+
+1. **Prompt 硬约束**：System Prompt 明确 `product_id` 只能从 `<retrieved_products>` 取；
+2. **流式抽取过滤**：`ProductCardExtractor` 用 `allowed_ids` 拦截 LLM 编造的 ID；
+3. **MySQL hydrate**：卡片的标题 / 价格 / SKU 名 全部走 `ProductRepository.get_card_view` 取真实数据，LLM 只提供 `reason` 文案；
+4. **缺仓库丢卡片**：MySQL 查不到 product_id 直接 drop 卡片，不会作为兜底显示；
+5. **LLM 异常兜底**：超时 / 限流时不让用户看到空白，emit error 后推检索 Top-3 真实商品。
+
+### (e) 测试覆盖
+
+```
+tests/
+├── test_card_extractor.py    9 用例（围栏跨 token 切分、未闭合丢弃、reason 截断、unknown id 过滤等）
+├── test_intent.py           11 用例（recommend / compare / cart_op / clarify 边界）
+├── test_doubao_client.py     3 用例（顺序 yield、空 delta、心跳 chunk 容错）
+├── test_retriever.py         5 用例（按 product_id 聚合、保留最高分、空检索）
+├── test_prompts.py           5 用例（防幻觉关键词在 system、检索块嵌入、history 透传）
+├── test_memory.py            5 用例（UUID 生成、复用、6 轮窗口截断）
+├── test_orchestrator.py      6 用例（happy path、clarify 短路、cart_op 占位、LLM 异常兜底、幻觉 id 拦截）
+└── test_api_chat.py          1 用例（FastAPI TestClient + dependency_overrides 走完 SSE）
+```
+
+合计 **45 条新增单测 / 集成测，全部绿**（55 总，连同 Phase 1 chunker 10 条）。
+
+### Phase 2 验收实测
+
+启动服务后跑：
+
+```bash
+cd server && bash scripts/smoke_chat.sh
+# 也可显式：bash scripts/smoke_chat.sh "200 元以下的蓝牙耳机"
+```
+
+实测输出（节选 query=`推荐一款适合油皮的洗面奶`）：
+
+```
+event: session
+data: {"session_id": "c17498d951494e4c9944d44b8e1a7222"}
+
+event: status   data: {"stage":"parsing"}
+event: status   data: {"stage":"retrieving"}
+event: status   data: {"stage":"generating"}
+
+event: token    data: {"text":"给"}
+event: token    data: {"text":"你"}
+...
+event: token    data: {"text":"性价比"}
+event: token    data: {"text":"很高"}
+event: token    data: {"text":"。"}
+
+event: product_card
+data: {
+  "product_id": "p_beauty_011",
+  "title": "珊珂洗颜专科绵润泡沫洁面乳…120g",
+  "brand": "珊珂",
+  "image_url": "http://127.0.0.1:8000/static/1_美妆护肤/images/p_beauty_011_live.jpg",
+  "price_range": {"min": 52.0, "max": 69.0},
+  "skus": [
+    {"sku_id":"s_p_beauty_011_1","properties":{"规格":"120g 标准装"},"price":52.0},
+    {"sku_id":"s_p_beauty_011_2","properties":{"规格":"150ml 起泡泵装"},"price":69.0}
+  ],
+  "reason": "泡沫绵密清洁力强，洗完不紧绷，适配油皮"
+}
+
+event: done     data: {"finish_reason":"stop"}
+```
+
+`p_beauty_011` 真实存在于 MySQL 与 Milvus，价格 / SKU 取自数据库快照，LLM 仅生成 reason 文案——满足 docs/01 §6.1 防幻觉约束。
+
+### Phase 2 复跑指令
+
+```bash
+cd server
+source .venv/bin/activate
+
+# 1. 依赖前置（如未跑过 Phase 1 数据准备）
+python -m app.db.init_db
+python -m scripts.seed_mysql
+python -m scripts.build_index --rebuild
+
+# 2. 跑单测套件（不需要 API Key，全离线）
+python -m pytest tests/ --ignore=tests/test_smoke.py
+
+# 3. 启动 FastAPI（另开窗口跑 smoke）
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+# 4. SSE 端到端
+bash scripts/smoke_chat.sh                                   # 默认 query
+bash scripts/smoke_chat.sh "200 元以下的蓝牙耳机有哪些？"      # 自定义
+
+# 5. 商品详情
+curl -s http://127.0.0.1:8000/api/v1/products/p_beauty_011 | python3 -m json.tool
 ```
 
 ---
