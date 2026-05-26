@@ -39,6 +39,7 @@ class RetrievedProduct:
     min_sku_price: float = 0.0
     max_sku_price: float = 0.0
     best_chunk_type: str = ""
+    title: str = ""                     # 商品标题（从 title chunk 提取，用户友好显示用）
 
 
 class RagRetriever:
@@ -85,6 +86,18 @@ def _score_of(hit: dict) -> float:
     return 0.0
 
 
+def _extract_title(chunk_text: str) -> str:
+    """从 title chunk 文本提取商品名。
+
+    chunker 把 title chunk 拼成 `<title> | 品牌：<brand> | 类目：<sub_category>`，
+    这里 split 第一段就是真实标题。容错：找不到分隔符就返回整段截断到 60 字。
+    """
+    if not chunk_text:
+        return ""
+    head = chunk_text.split(" | ", 1)[0].strip()
+    return head[:80] if head else ""
+
+
 def _aggregate(hits: Sequence[dict], top_n_products: int) -> list[RetrievedProduct]:
     """把 chunk 命中按 product_id 聚合。
 
@@ -113,11 +126,15 @@ def _aggregate(hits: Sequence[dict], top_n_products: int) -> list[RetrievedProdu
                 best_chunk_text=text,
                 best_chunk_type=chunk_type,
                 supporting_chunks=[text] if text else [],
+                title=_extract_title(text) if chunk_type == "title" else "",
             )
         else:
             prod = by_pid[pid]
             if text and text not in prod.supporting_chunks:
                 prod.supporting_chunks.append(text)
+            # 若本商品后续出现 title chunk，且 title 字段还空着，补上
+            if not prod.title and chunk_type == "title" and text:
+                prod.title = _extract_title(text)
             # score 已经是降序进来，这里只记当前商品额外出现，不更新 score
 
     # by_pid 的插入顺序即按分数降序（dict 保序）

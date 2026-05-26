@@ -25,6 +25,7 @@ from app.agent.memory_summarizer import MemorySummarizer
 from app.agent.prompts import build_compare_messages, build_recommend_messages
 from app.agent.query_rewriter import ParsedQuery, QueryRewriter
 from app.rag.retriever import RetrievedProduct
+from app.rag.structured_retriever import StructuredRetriever, is_search_query_degraded
 from app.schemas.chat import ChatRequest
 from app.utils.logger import get_logger
 
@@ -62,6 +63,7 @@ class AgentOrchestrator:
         compare_extractor: CompareTargetExtractor | None = None,
         clarify_detector: ClarifyDetector | None = None,
         memory_summarizer: MemorySummarizer | None = None,
+        structured_retriever: StructuredRetriever | None = None,
     ) -> None:
         self.retriever = retriever
         self.llm = llm
@@ -77,6 +79,8 @@ class AgentOrchestrator:
         self.clarify_detector = clarify_detector
         # memory_summarizer 缺省时 history 走 FIFO 截断（保 phase 2 行为）。
         self.memory_summarizer = memory_summarizer
+        # structured_retriever 缺省时不启用 SQL fallback（保 phase 2 行为）。
+        self.structured_retriever = structured_retriever
 
     async def orchestrate(self, req: ChatRequest) -> AsyncIterator[dict]:
         session = self.memory.get_or_create(req.session_id)
@@ -118,15 +122,18 @@ class AgentOrchestrator:
             yield {"event": "done", "data": {"finish_reason": "stop"}}
             return
 
-        # 2) 检索（Phase 4：先 query_rewriter 抽干净 query + filter，再走向量召回 + metadata filter）
+        # 2) 检索（Phase 4：query_rewriter + retrieve）
         yield {"event": "status", "data": {"stage": "retrieving"}}
-        parsed = await self._rewrite(intent.search_query, history=session.history)
+        # Phase 4 收尾 R1：把 session.summary 一并传给 rewriter；summary 压缩后
+        # 主体词在 summary 而非 history 最近 3 轮里，必须显式喂下去。
+        parsed = await self._rewrite(
+            intent.search_query, history=session.history, summary=session.summary,
+        )
         filter_expr = parsed.to_filter_expr()
         if filter_expr:
             logger.info("Milvus filter_expr=%s, search_query=%s", filter_expr, parsed.search_query)
 
-        # 2.5) Phase 4-3 主动澄清：recommend 意图信息不足时短路 emit clarify + done，
-        # 不再走 LLM 推一台"瞎猜的"商品出来。
+        # 2.5) Phase 4-3 主动澄清：recommend 意图信息不足时短路 emit clarify + done。
         if intent.intent == "recommend" and self.clarify_detector is not None:
             decision = self.clarify_detector.assess(
                 intent_name=intent.intent,
@@ -138,25 +145,23 @@ class AgentOrchestrator:
                     "event": "clarify",
                     "data": {"question": decision.question, "options": decision.options},
                 }
-                # 这一轮不进 retrieve，也不算一次完整推荐，但要把 user message 写进 memory
-                # 方便下一轮用户点 chip 后能续上下文
                 self.memory.save_turn(session.id, req.message, "", [])
                 yield {"event": "done", "data": {"finish_reason": "stop"}}
                 return
 
         if intent.intent == "compare":
-            # Phase 4-2：compare 分支拆 targets 并行检索，保证 2-3 件代表商品都进 prompt
+            # Phase 4-2：compare 分支拆 targets 并行检索。Phase 4 收尾 R3：透传 summary。
             retrieved = await self._compare_retrieve(
                 original_query=intent.search_query,
                 rewritten=parsed.search_query,
                 filter_expr=filter_expr,
+                history=session.history,
+                summary=session.summary,
             )
         else:
-            retrieved = self.retriever.search(parsed.search_query, filter_expr=filter_expr)
-            # 命中为空时降级：去掉 filter 再来一次，避免"啥也搜不到"的死路（用户体验优先）
-            if not retrieved and filter_expr:
-                logger.info("filter 过严命中 0 条，去除过滤兜底再检索")
-                retrieved = self.retriever.search(parsed.search_query)
+            retrieved = await self._recommend_retrieve(
+                parsed, filter_expr=filter_expr, original_message=req.message,
+            )
 
         # 3) 生成
         yield {"event": "status", "data": {"stage": "generating"}}
@@ -217,17 +222,69 @@ class AgentOrchestrator:
         self.memory.save_turn(session.id, req.message, full_visible, emitted_card_ids)
         yield {"event": "done", "data": {"finish_reason": "stop"}}
 
+    async def _recommend_retrieve(
+        self,
+        parsed: ParsedQuery,
+        *,
+        filter_expr: str | None,
+        original_message: str = "",
+    ) -> list[RetrievedProduct]:
+        """recommend 分支检索：Phase 4 收尾 R4 加 SQL fallback 路由。
+
+        路由优先级：
+        1. search_query 退化 或 original_message 是结构化承接短句 →
+           走 SQL，绕过 embedding，直接按 price/brand/category 在 MySQL 查；
+        2. 否则走原向量召回 + scalar filter；
+        3. 向量召回为空且有 filter → 去掉 filter 兜底再来一次。
+        """
+        # R4：query 退化时走 SQL fallback
+        if (
+            self.structured_retriever is not None
+            and filter_expr  # 必须有 filter，否则 SQL 拒绝执行
+            and is_search_query_degraded(
+                parsed.search_query, original_message=original_message,
+            )
+        ):
+            logger.info(
+                "search_query=%r 退化，走 SQL fallback (price_min=%s, price_max=%s)",
+                parsed.search_query, parsed.price_min, parsed.price_max,
+            )
+            sql_hits = await self.structured_retriever.search(
+                price_min=parsed.price_min,
+                price_max=parsed.price_max,
+                categories=parsed.categories or None,
+                brands_include=parsed.brands_include or None,
+                brands_exclude=parsed.brands_exclude or None,
+                limit=5,
+            )
+            if sql_hits:
+                return sql_hits
+            logger.info("SQL fallback 0 条，回退向量召回")
+
+        retrieved = self.retriever.search(parsed.search_query, filter_expr=filter_expr)
+        # 命中为空且有 filter → 去掉 filter 兜底
+        if not retrieved and filter_expr:
+            logger.info("filter 过严命中 0 条，去除过滤兜底再检索")
+            retrieved = self.retriever.search(parsed.search_query)
+        return retrieved
+
     async def _compare_retrieve(
         self,
         *,
         original_query: str,
         rewritten: str,
         filter_expr: str | None,
+        history: list[dict] | None = None,
+        summary: str | None = None,
     ) -> list[RetrievedProduct]:
         """compare 分支专用：每个 target 各 Top-2，合并去重最多 3 件塞 prompt。
 
+        Phase 4 收尾 R3：extractor 接 history/summary，让 LLM 处理"刚才推荐的"
+        指代代词，从 history 抓 product_id 直接作为 target。
+
         没接 extractor 或拆不出 ≥2 个 target → 退化成整句一次性检索。
-        合并后 < 2 件时去掉 filter 兜底再来一次（避免 filter 太严卡住对比）。
+        target 是 product_id（如"p_beauty_011"）时也能正常 retrieve——retriever
+        对 product_id 做 embedding 仍能召回到自身（Phase 1 sanity 已验证）。
         """
         # 没接 extractor 直接走整句
         if self.compare_extractor is None:
@@ -237,7 +294,9 @@ class AgentOrchestrator:
             return retrieved
 
         try:
-            plan = await self.compare_extractor.plan(original_query)
+            plan = await self.compare_extractor.plan(
+                original_query, history=history, summary=summary,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("compare 拆 target 异常，整句兜底：%s", exc)
             plan = None
@@ -258,7 +317,7 @@ class AgentOrchestrator:
             hits = self.retriever.search(tgt, top_n_products=2, filter_expr=filter_expr)
             for p in hits:
                 merged.setdefault(p.product_id, p)
-        # 合起来不足 2 件时去掉 filter 重试，避免对比一边查不到
+        # 合起来不足 2 件时去掉 filter 重试
         if len(merged) < 2 and filter_expr:
             for tgt in targets:
                 for p in self.retriever.search(tgt, top_n_products=2):
@@ -269,7 +328,6 @@ class AgentOrchestrator:
                 merged.setdefault(p.product_id, p)
                 if len(merged) >= 3:
                     break
-        # 最多 3 件，保证 prompt 不爆 + LLM 表格不超宽
         return list(merged.values())[:3]
 
     async def _rewrite(
@@ -277,12 +335,15 @@ class AgentOrchestrator:
         search_query: str,
         *,
         history: list[dict] | None = None,
+        summary: str | None = None,
     ) -> ParsedQuery:
         """没接 rewriter 就返回 identity ParsedQuery（保 Phase 2 行为）。"""
         if self.query_rewriter is None:
             return ParsedQuery(search_query=search_query)
         try:
-            return await self.query_rewriter.parse(search_query, history=history)
+            return await self.query_rewriter.parse(
+                search_query, history=history, summary=summary,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.warning("QueryRewriter.parse 异常，走原文检索：%s", exc)
             return ParsedQuery(search_query=search_query)

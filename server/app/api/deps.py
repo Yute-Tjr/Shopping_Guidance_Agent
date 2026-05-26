@@ -17,6 +17,7 @@ from app.agent.query_rewriter import QueryRewriter, build_query_rewriter
 from app.db.product_repo import ProductRepository, get_product_repository
 from app.llm.doubao_client import DoubaoChatClient, build_chat_client_from_settings
 from app.rag.retriever import RagRetriever, build_retriever_from_settings
+from app.rag.structured_retriever import StructuredRetriever, build_structured_retriever
 
 
 @lru_cache(maxsize=1)
@@ -50,6 +51,11 @@ def get_memory_summarizer() -> MemorySummarizer:
     return build_memory_summarizer(llm=get_llm_client())
 
 
+@lru_cache(maxsize=1)
+def get_structured_retriever() -> StructuredRetriever:
+    return build_structured_retriever()
+
+
 def get_conversation_memory() -> ConversationMemory:
     return get_memory()
 
@@ -64,6 +70,7 @@ def get_orchestrator() -> AgentOrchestrator:
         compare_extractor=get_compare_extractor(),
         clarify_detector=get_clarify_detector(),
         memory_summarizer=get_memory_summarizer(),
+        structured_retriever=get_structured_retriever(),
     )
 
 

@@ -307,9 +307,13 @@ class _FakeCompareExtractor:
         from app.agent.compare_planner import ComparePlan
         self._plan = ComparePlan(targets=list(targets), raw_segments=list(targets))
         self.calls = 0
+        self.last_history: list[dict] | None = None
+        self.last_summary: str | None = None
 
-    async def plan(self, message: str):
+    async def plan(self, message: str, *, history=None, summary=None):
         self.calls += 1
+        self.last_history = history
+        self.last_summary = summary
         return self._plan
 
 

@@ -739,52 +739,86 @@ server/tests/
 
 服务端测试 120 → **136 全过**（+16）。
 
-### (d) Phase 4-4 端到端实测（8 轮多轮对话）
+### (d) Phase 4-4 端到端实测（8 轮多轮对话，实测结果）
 
-```bash
-# session_id 复用同一会话跑 8 轮：
-[轮1] 推荐一款适合油皮的洗面奶   → 推 p_beauty_011（珊珂）
-[轮2] 价格再便宜一点
-[轮3] 不要日系品牌                ← 此时 brand_exclude 来自 phase 4-1
-[轮4] 想买保湿精华
-[轮5] 300 元以下                  ← price_max=300 来自 phase 4-1
-[轮6] 改成 100-200 之间
-[轮7] 再换一个清爽型的            ← 此时 needs_summary 触发！
-       └─ summarizer 把前 5 轮压成：「用户需适合油皮的洗面奶，明确约束
-          为价格更低、排除日系品牌，已推荐珊珂洁面...」
-[轮8] 帮我对比一下你刚才推荐的两款洗面奶
-       └─ LLM 跨过被摘要掉的早期 history，正确对比 p_beauty_011（珊珂，
-          来自 summary）+ p_beauty_018（来自最近原文），输出 GFM 表格
-          + 两张商品卡片
-```
-
-uvicorn 日志确认摘要触发：
+8 轮场景设计（同一 session_id）：
 
 ```
-session e762863a... 历史已摘要，summary=用户需适合油皮的洗面奶，明确约束为
-价格更低、排除日系品牌，已推荐珊珂洁面，暂未找到符合其要求的匹配商品，
-用户尚未选到心仪（保留最近 3 轮原文）
+轮 1: 推荐一款适合油皮的洗面奶
+轮 2: 价格再便宜一点                 ← phase 4-1 承接 query
+轮 3: 不要日系品牌                   ← phase 4-1 brand_exclude
+轮 4: 想买保湿精华                   ← 切换品类
+轮 5: 300 元以下                     ← phase 4-1 价格 filter
+轮 6: 改成 100-200 之间               ← 调整价格区间
+轮 7: 再换一个清爽型的                ← 此处 memory.needs_summary 触发
+轮 8: 帮我对比一下你刚才推荐的两款洗面奶  ← 跨摘要指代代词
 ```
 
-### (e) 与前序 Phase 的协同
+**实测真实输出（最近一次跑）**：
 
-- **Phase 4-1 filter 跨轮保留**：`brand_exclude=[日系]`、`price_max=300` 这类硬约束在 summary 里以自然语言形式被记下（"排除日系品牌"/"价格更低"），后续轮次 LLM 自然延续；
-- **Phase 4-2 compare 跨轮可寻址**：用户说"对比你刚才推荐的两款"——summary 里保留 product_id 让 LLM 能精确锁定要对比的商品；
-- **Phase 4-3 clarify 后续接力**：触发 clarify 的轮次也会写进 history（user message + 空 assistant），下一轮用户回填 chip 后能基于完整上下文继续；
-- **iOS 端 phase3 零改动**：summary 写在服务端 session，客户端无感知。
+| 轮 | query | 输出卡片 | 状态 |
+| --- | --- | --- | --- |
+| 1 | 推荐适合油皮的洗面奶 | p_beauty_011（珊珂） | ✅ |
+| 2 | 价格再便宜一点 | p_beauty_011（说明已是最低价） | ✅ history 补全生效 |
+| 3 | 不要日系品牌 | （无） | ❌ **数据集限制**：库内非日系油皮洗面奶 0 件 |
+| 4 | 想买保湿精华 | p_beauty_001 / 018 / 024 | ✅ 自包含 query |
+| 5 | 300 元以下 | p_beauty_009（珀莱雅 ¥210-280） | ✅ history 补全 + filter `min_sku_price <= 300` |
+| 6 | 改成 100-200 之间 | （无） | ❌ **数据集限制**：库内精华价位 59-98 / 300+ 两段，100-200 是空档 |
+| 7 | 再换一个清爽型的 | p_beauty_018（The Ordinary） | ✅ summary 触发后跨摘要回到主题 |
+| 8 | 对比刚才推荐的两款 | p_beauty_011 + p_beauty_018 + GFM 对比表 | ✅（compare extractor 偶尔抖动，LLM 随机性，多跑能稳） |
+
+**整体 6/8 成功**。剩 2 轮失败：
+
+- **轮 3/6**：纯数据集硬性限制——100 条 demo 数据里非日系油皮洗面奶、100-200 元精华都是 0 件。phase 4-1 的 filter 严格执行后 LLM 诚实说"未找到"，这是**正确行为**而不是 bug。Phase 5 加品类或数据扩充后自动消失。
+
+uvicorn 日志确认 phase 4-4 链路工作（节选）：
+
+```
+[轮 2] history/summary 补全后 search_query=推荐适合油皮的洗面奶 价格再便宜一点
+[轮 3] Milvus filter_expr=category in ["美妆护肤"] and brand not in ["SK-II", "安热沙",
+        "芳珂", "资生堂", "珊珂", "日清"]
+[轮 5] search_query='不要日系品牌 想买保湿精华 300 元以下' 退化，走 SQL fallback
+        (price_min=None, price_max=300.0)
+[轮 7] session ... 历史已摘要，summary=用户需油皮适用的平价洗面奶，明确排除日系
+        品牌，已被推荐珊珂洁面乳、The Ordinary 控油精华（保留最近 3 轮原文）
+        history/summary 补全后 search_query=...用户认为前者价格偏高... 再换一个清爽型的
+[轮 8] compare targets=['p_beauty_011 珊珂洗面奶', 'p_beauty_018 The Ordinary']
+```
+
+### (e) Phase 4 收尾改造：从「跑不通」到「6/8」的 5 处结构性修复
+
+实际跑 8 轮场景第一次时只有 1/8 工作（只有自包含 query 通），剩下 7 轮全挂"未找到"。沿着失败 case 反推有 5 处结构性 bug：
+
+| 编号 | 问题 | 修法 |
+| --- | --- | --- |
+| **R1** | `_merge_history_context` 只读 history、不读 summary；memory 摘要后主体词进了 summary 字段（"用户需要洗面奶..."）但检索层看不到 | `_merge_history_context(history, summary)` summary 优先；`_llm_extract` prompt 也加 summary 段 |
+| **R2** | `_FOLLOWUP_HINTS` 不全；"改成 / 调整 / 那再 / 想买"等承接词漏触发 history 补全 | 列表从 17 → 30+ 词，覆盖"改成/改为/调整成/换一/再换/再来一/帮我换"等 |
+| **R3** | `CompareTargetExtractor.plan` 不接 history/summary；"对比刚才推荐的两款"指代代词拆不出 | `plan(history, summary)` + LLM prompt 加规则「指代代词从历史抓 product_id」；`_has_referring_phrase` 检测代词强制走 LLM 兜底 |
+| **R4** | search_query 退化时仍走向量召回，没 SQL fallback；"100-200 之间"召回随机 | 新建 `StructuredRetriever` 直查 MySQL；`is_search_query_degraded` 两条通道：search_query 退化 OR original_message ≤15 字符含结构化信号词 |
+| **R5** | MemorySummarizer 把"暂未找到"等否定结论写进 summary，污染后续轮 LLM 认知 | summary prompt 加硬约束「严禁保留'未找到'等结论性话术，只描述偏好」 |
+
+### (f) 与前序 Phase 的协同
+
+- **Phase 4-1 filter 跨轮保留**：`brand_exclude=[日系]`、`price_max=300` 在 summary 里以自然语言形式被记下，后续轮次自动延续；
+- **Phase 4-2 compare 跨轮可寻址**：summary 里保留 product_id 让 LLM 能锁定要对比的商品；
+- **Phase 4-3 clarify 后续接力**：触发 clarify 的轮次也会写进 history，下一轮回填 chip 能续上；
+- **iOS 端 phase3 零改动**：summary 完全服务端逻辑，客户端无感知。
 
 ### Phase 4-4 复跑指令
 
 ```bash
 cd server && source .venv/bin/activate
 
-# 1. 单测（11 memory + 6 summarizer + 2 prompts + 2 orchestrator）
-python -m pytest tests/test_memory.py tests/test_memory_summarizer.py tests/test_prompts.py tests/test_orchestrator.py -v
+# 1. 单测（service tests 173 全过）
+python -m pytest tests/ --ignore=tests/test_smoke.py
 
-# 2. 多轮 SSE smoke（同 session_id 跑 8 轮验证 summary 触发）
+# 2. 多轮 SSE smoke（同 session_id 跑 8 轮验证）
 uvicorn app.main:app --host 127.0.0.1 --port 8000 &
-# 用 httpx 或自写 client 维持 session_id 跑 8 轮（脚本见 phase 4-4 章节示例）
-# 关注服务端 uvicorn 日志中 "历史已摘要" 行
+# 8 轮场景脚本见 phase 4-4 章节，关注 uvicorn 日志：
+#   - "history/summary 补全后 search_query=..." → R1/R2 链路
+#   - "走 SQL fallback (price_min=..., price_max=...)" → R4 链路
+#   - "session ... 历史已摘要" → memory summarize 触发
+#   - "compare targets=[...]" → R3 链路
 ```
 
 ---

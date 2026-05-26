@@ -259,6 +259,88 @@ async def test_history_not_used_when_self_contained():
 
 
 @pytest.mark.asyncio
+async def test_history_completes_followup_with_price_softener():
+    """「价格再便宜一点」是典型承接 query，没有显式 filter 但必须从 history 补主体。"""
+    rw = build_query_rewriter()
+    history = [
+        {"role": "user", "content": "推荐一款适合油皮的洗面奶"},
+        {"role": "assistant", "content": "为你推荐珊珂..."},
+    ]
+    pq = await rw.parse("价格再便宜一点", history=history)
+    # 关键：search_query 必须含"洗面奶"主体，否则向量召回打偏
+    assert "洗面奶" in pq.search_query
+    assert "再便宜一点" in pq.search_query or "便宜" in pq.search_query
+
+
+@pytest.mark.asyncio
+async def test_history_completes_followup_with_negation_only():
+    """「不要日系品牌」开头是承接词，需要从 history 补品类主体。"""
+    rw = build_query_rewriter()
+    history = [
+        {"role": "user", "content": "推荐一款适合油皮的洗面奶"},
+        {"role": "assistant", "content": "..."},
+    ]
+    pq = await rw.parse("不要日系品牌", history=history)
+    assert "洗面奶" in pq.search_query
+
+
+@pytest.mark.asyncio
+async def test_followup_keywords_dont_misfire_on_descriptive_phrases():
+    """承接关键词不能误伤普通描述句：「换季敏感肌的精华」里的"换"不是承接词。"""
+    rw = build_query_rewriter()
+    history = [{"role": "user", "content": "推荐一款适合油皮的洗面奶"}]
+    pq = await rw.parse("换季敏感肌的精华", history=history)
+    # 不应被 history 污染：search_query 不能出现"洗面奶"
+    assert "洗面奶" not in pq.search_query
+    assert "精华" in pq.search_query
+
+
+@pytest.mark.asyncio
+async def test_summary_used_when_history_lacks_subject():
+    """phase 4-4 实测轮 7 挂的根因：memory 摘要后 history 最近 3 轮没主体词，
+    必须从 session.summary 抠回品类。"""
+    rw = build_query_rewriter()
+    # 模拟 phase 4-4 实际场景：summary 保留了主体，history 最近几轮都是承接句
+    summary = "用户需要保湿精华，预算 100-200 元，排除日系品牌，已推荐 The Ordinary"
+    history = [
+        {"role": "user", "content": "300 元以下"},
+        {"role": "assistant", "content": "..."},
+        {"role": "user", "content": "改成 100-200 之间"},
+        {"role": "assistant", "content": "..."},
+    ]
+    pq = await rw.parse("再换一个清爽型的", history=history, summary=summary)
+    # search_query 必须含"精华"主体——summary 里有，history 里没有
+    assert "精华" in pq.search_query
+
+
+@pytest.mark.asyncio
+async def test_summary_takes_priority_over_history():
+    """summary 比 history 信息密度高，应优先采用。"""
+    rw = build_query_rewriter()
+    summary = "用户已经在选跑鞋"
+    history = [
+        {"role": "user", "content": "之前推荐了洗面奶"},  # 干扰项
+        {"role": "assistant", "content": "..."},
+    ]
+    pq = await rw.parse("再便宜一点", history=history, summary=summary)
+    # summary 里的"跑鞋"应被优先采用
+    assert "跑鞋" in pq.search_query
+    assert "洗面奶" not in pq.search_query
+
+
+@pytest.mark.asyncio
+async def test_followup_hint_change_pattern():
+    """phase 4-4 实测轮 6：'改成 100-200 之间' 之前不触发补全。"""
+    rw = build_query_rewriter()
+    history = [{"role": "user", "content": "想买保湿精华"}]
+    pq = await rw.parse("改成 100-200 之间", history=history)
+    assert pq.price_min == 100
+    assert pq.price_max == 200
+    # 必须从 history 补主体词
+    assert "精华" in pq.search_query
+
+
+@pytest.mark.asyncio
 async def test_history_ignored_when_history_empty():
     """history 为空或 None 时按原行为返回。"""
     rw = build_query_rewriter()

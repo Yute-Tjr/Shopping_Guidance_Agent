@@ -118,6 +118,29 @@ struct ChatViewModelTests {
         #expect(vm.messages.last?.text == "好的")
     }
 
+    @Test func resetSessionClearsMessagesAndSessionID() async {
+        // 跑完一轮对话，sessionID + messages 都不为空
+        let transport = FakeChatTransport(events: [
+            .session(id: "sess-1"),
+            .token(text: "hi"),
+            .productCard(sampleCard()),
+            .done,
+        ])
+        let vm = ChatViewModel(transport: transport)
+        vm.inputText = "推荐一款洗面奶"
+        await vm.send()
+        #expect(vm.sessionID == "sess-1")
+        #expect(vm.messages.count == 2)
+
+        // 点"新建会话" → messages 清空 + sessionID 归零
+        // ChatView 的 .onChange(of: messages.count) 监听到 count 从 >0 变 0
+        // 会触发 ScrollViewReader 把空状态滚回顶部（这部分纯 UI 行为，
+        // SwiftUI 视图层不在单测覆盖范围；此用例保证 ViewModel 状态正确清零）
+        vm.resetSession()
+        #expect(vm.messages.isEmpty)
+        #expect(vm.sessionID == nil)
+    }
+
     @Test func sessionIDPersistsAcrossTurns() async {
         // 第一轮 session 返回 id
         let t1 = FakeChatTransport(events: [

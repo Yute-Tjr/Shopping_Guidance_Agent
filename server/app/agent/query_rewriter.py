@@ -260,13 +260,22 @@ class QueryRewriter:
         message: str,
         *,
         history: list[dict] | None = None,
+        summary: str | None = None,
     ) -> ParsedQuery:
-        """规则跑一遍 → 不够再调 LLM 补缺；最终合并返回。
+        """规则 → LLM 兜底 → history/summary 补全。顺序很关键。
 
-        ``history`` 用于多轮指代消解：当用户写"1000 元以上的"这种承接上文的
-        补充约束时，单看本句缺少品类语义，会让向量召回打偏。规则路径下若
-        发现剥词后 search_query 极短，从 history 最近 user message 拼上主体
-        名词；LLM 路径下也会带着 history 让 LLM 输出 self-contained query。
+        ``history`` 是最近未压缩的对话轮次（user/assistant pair）。
+        ``summary`` 是 phase 4-4 MemorySummarizer 压缩前段对话得到的偏好概述
+        （e.g. "用户需要油皮洗面奶，已推荐珊珂..."）。
+
+        当 memory 触发摘要后 history 只剩最近 3 轮原文，关键主体词（"洗面奶"
+        "跑鞋"）很可能不在最近 3 轮里，必须从 summary 抠回来——这就是 phase 4-4
+        实测轮 7 挂掉的根因（_merge_history_context 之前只读 history）。
+
+        执行顺序：
+        1. 规则抽 price/brand filter；
+        2. 规则不够 → LLM 兜底（带 history+summary 让 LLM 输出 self-contained query）；
+        3. **最后**做 history/summary 补全（主体词找回兜底）。
         """
         text = (message or "").strip()
         if not text:
@@ -274,27 +283,22 @@ class QueryRewriter:
 
         rule = self._parse_rules(text)
 
-        # Phase 4 多轮指代消解：本句剥词后 search_query 太短且抓到了
-        # 价格/品牌 filter，认为这是承接上文，从 history 补主体名词回去
-        if history and _needs_context_completion(rule, original=text):
-            rule.search_query = _merge_history_context(rule.search_query, history)
-            logger.info("history 上下文补全后 search_query=%s", rule.search_query)
+        # LLM 兜底
+        if not self._rules_enough(text, rule) and self.llm is not None:
+            try:
+                llm_result = await self._llm_extract(text, history=history, summary=summary)
+                rule = _merge(rule, llm_result, brands_whitelist=self._brands_lower)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("QueryRewriter LLM 抽取失败，仅用规则：%s", exc)
 
-        # 规则已能定下价格 + 品牌排除，且没有"日系/国产/韩系/欧美"这类需要语义推断的词
-        # 时不再调 LLM，省一次往返。
-        if self._rules_enough(text, rule):
-            return rule
+        # 主体词补全：summary 优先（提取过的偏好概述更稳），history 兜底
+        if (history or summary) and _needs_context_completion(rule, original=text):
+            rule.search_query = _merge_history_context(
+                rule.search_query, history=history, summary=summary
+            )
+            logger.info("history/summary 补全后 search_query=%s", rule.search_query)
 
-        if self.llm is None:
-            return rule  # 没接 LLM 也别崩
-
-        try:
-            llm_result = await self._llm_extract(text)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("QueryRewriter LLM 抽取失败，仅用规则：%s", exc)
-            return rule
-
-        return _merge(rule, llm_result, brands_whitelist=self._brands_lower)
+        return rule
 
     # ---- rule path ----
 
@@ -399,18 +403,54 @@ class QueryRewriter:
 
     # ---- LLM path ----
 
-    async def _llm_extract(self, text: str) -> dict[str, Any]:
+    async def _llm_extract(
+        self,
+        text: str,
+        *,
+        history: list[dict] | None = None,
+        summary: str | None = None,
+    ) -> dict[str, Any]:
         brand_block = self._format_brand_block()
+        context_block = self._format_context_block(history, summary)
         user_msg = (
             f"已知品牌列表（只能从这里选）：\n{brand_block}\n\n"
-            f"用户输入：{text}\n"
-            "请输出 JSON。"
+            f"{context_block}"
+            f"用户当前输入：{text}\n"
+            "请输出 JSON。search_query 必须 self-contained：若当前输入承接上文（如 "
+            "「再便宜一点」「不要日系」「改成 100-200」），请把对话历史 / 偏好概述里的"
+            "品类主体词（洗面奶 / 跑鞋 等）拼进 search_query，不要写成「商品」「产品」"
+            "「东西」之类的泛词。"
         )
         messages = [
             {"role": "system", "content": self._SYSTEM_PROMPT},
             {"role": "user", "content": user_msg},
         ]
         return await self.llm.chat_json(messages)  # type: ignore[union-attr]
+
+    @staticmethod
+    def _format_context_block(
+        history: list[dict] | None,
+        summary: str | None,
+    ) -> str:
+        """把 summary + 最近 2 轮 history 拼成 LLM 可读的上下文段。
+
+        summary 放最前面（它是 LLM 已经提炼好的偏好概述，比 history 流水账信息密度高）。
+        """
+        parts: list[str] = []
+        if summary and summary.strip():
+            parts.append(f"用户偏好概述（来自前段对话摘要）：\n{summary.strip()[:200]}")
+        if history:
+            recent: list[str] = []
+            for m in history[-4:]:
+                role = m.get("role")
+                content = (m.get("content") or "").strip()
+                if role in ("user", "assistant") and content:
+                    recent.append(f"{role}: {content[:80]}")
+            if recent:
+                parts.append("对话历史（最近几轮）：\n" + "\n".join(recent))
+        if not parts:
+            return ""
+        return "\n\n".join(parts) + "\n\n"
 
     def _format_brand_block(self) -> str:
         if not self._brands:
@@ -476,13 +516,37 @@ def _merge(
     return out
 
 
+# 承接关键词：句子里出现这些词时认为是接续上文的补充约束，
+# 哪怕规则路径还没抓到 filter 也要先补 history/summary 上下文，
+# 让 embedding 拿到主体语义。
+# 设计原则：单字承接词容易误伤（"换"撞"换季敏感肌"），所以单字只放"再"，
+# 其余都用多字组合。
+_FOLLOWUP_HINTS: tuple[str, ...] = (
+    # 单字（高频接续）
+    "再",
+    # 否定 / 排除
+    "不要", "不是", "排除", "除了", "非 ",
+    # 替换 / 调整（覆盖 phase 4 实测里挂掉的"改成 100-200 之间"）
+    "换一", "再换", "再来一", "另外来", "帮我换",
+    "改成", "改为", "改到", "调整到", "调整成", "调成",
+    "这次", "那再", "那来",
+    # 指代 / 类似
+    "另外", "其他", "别的", "类似", "同款", "这种", "这款",
+    "那个", "那些", "那款", "这样的",
+    # 价格趋势
+    "便宜一点", "贵一点", "实惠一点", "高端一点", "再便宜", "再贵",
+)
+
+
 def _needs_context_completion(parsed: ParsedQuery, *, original: str) -> bool:
     """判定 search_query 是不是「承接上文的补充约束」需要 history 补全。
 
-    触发条件（任一）：
-    - 原句很短（< 8 中文字符）且抓到了 price / brand 任意 filter，多半是
-      "1000 元以上的" / "再便宜一点" / "不要日系" 这种增量约束；
-    - 剥词后 search_query 几乎为空（≤ 2 字符）也补一下，省得 embedding 打偏。
+    触发条件（任一即触发）：
+    1. 原句很短（< 8 字符）且抓到了 price / brand 任意 filter，典型如
+       "1000 元以上的" / "300 元以下"；
+    2. 剥词后 search_query 几乎为空（≤ 2 字符）；
+    3. 句子开头 6 字内含「承接关键词」（"再便宜一点" / "不要日系" / "换一款"），
+       这种 query 本身没品类语义，必须从 history 补主体词，否则向量召回打偏。
     """
     sq = parsed.search_query.strip()
     has_filter = bool(
@@ -495,26 +559,52 @@ def _needs_context_completion(parsed: ParsedQuery, *, original: str) -> bool:
         return True
     if len(sq) <= 2:
         return True
+    # 承接关键词触发：原句较短（< 15 字符）且开头 6 字内含承接词。
+    # 限制"开头 6 字"是为避免"换季敏感肌的精华"这种把"换"夹在描述里的句子误触发。
+    if len(original) < 15:
+        head = original[:6]
+        if any(hint in head for hint in _FOLLOWUP_HINTS):
+            return True
     return False
 
 
-def _merge_history_context(search_query: str, history: list[dict]) -> str:
-    """从 history 最近 2 条 user message 抽主体词拼到 search_query 前。
+def _merge_history_context(
+    search_query: str,
+    *,
+    history: list[dict] | None = None,
+    summary: str | None = None,
+) -> str:
+    """summary 优先 → history user 兜底，把主体词拼到 search_query 前。
 
-    粗糙但有效：直接把最近 user 文本与 search_query 拼接，embedding 模型
-    自己消化语义，不再尝试在客户端做 NLP 分词。控制总长 ≤ 80 字符避免污染。
+    为什么 summary 优先：
+    - summary 是 LLM 已经从前段对话提炼好的偏好概述（"用户需要油皮洗面奶，
+      已推荐珊珂..."），主体词密度高、噪音少；
+    - history 是流水账，最近几轮 user message 可能都是承接句（"再便宜一点"/
+      "300 元以下"），自己也没主体词。
+    - phase 4-4 实测：memory 触发摘要后 history 只剩最近 3 轮原文，主体词
+      已经在 summary 里——只读 history 会丢主体（实测轮 7 挂在这里）。
+
+    控制总长 ≤ 120 字符避免污染 embedding。
     """
-    user_msgs = [
-        m.get("content", "").strip()
-        for m in history
-        if m.get("role") == "user" and m.get("content")
-    ]
-    if not user_msgs:
+    context_parts: list[str] = []
+    if summary:
+        s = summary.strip()
+        if s:
+            context_parts.append(s[:120])
+    if not context_parts and history:
+        user_msgs = [
+            m.get("content", "").strip()
+            for m in history
+            if m.get("role") == "user" and m.get("content")
+        ]
+        if user_msgs:
+            context_parts.append(" ".join(user_msgs[-2:]))
+    if not context_parts:
         return search_query
-    context = " ".join(user_msgs[-2:])
+    context = " ".join(context_parts)
     merged = f"{context} {search_query}".strip()
-    if len(merged) > 80:
-        merged = merged[-80:]
+    if len(merged) > 120:
+        merged = merged[-120:]
     return merged
 
 

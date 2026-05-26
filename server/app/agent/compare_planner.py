@@ -57,39 +57,67 @@ class CompareTargetExtractor:
         "请把它拆成同样数量的独立检索 query。每个 query 必须 self-contained：包含品牌/商品名"
         "+ 用户关心的属性（如保湿、跑步、降噪 等）。\n"
         '只输出 JSON 对象 {"targets": ["...", "..."]}，不要 markdown，不要解释。\n'
-        "示例：\n"
+        "重要规则：\n"
+        '- 当用户使用指代代词（"刚才推荐的两款" / "你说的那两个" / "前面那几款"）时，'
+        "**从下方的对话历史 / 偏好概述里抓 product_id 或商品名**作为 target，"
+        "不要凭空猜。\n"
+        '- 抓到 product_id（形如 p_beauty_011）就直接作为 target；'
+        '抓到商品名就用商品名 + 关键属性作为 target。\n'
+        '示例：\n'
         '  输入：对比一下兰蔻和雅诗兰黛的精华哪个更保湿\n'
         '  输出：{"targets": ["兰蔻 精华 保湿", "雅诗兰黛 精华 保湿"]}\n'
         '  输入：iPhone 17 vs 华为 Pura 90\n'
-        '  输出：{"targets": ["iPhone 17", "华为 Pura 90"]}'
+        '  输出：{"targets": ["iPhone 17", "华为 Pura 90"]}\n'
+        '  输入：对比刚才推荐的两款洗面奶（历史里出现 p_beauty_011 和 p_beauty_018）\n'
+        '  输出：{"targets": ["p_beauty_011", "p_beauty_018"]}'
     )
 
     def __init__(self, *, llm: _LLMJSON | None = None) -> None:
         self.llm = llm
 
-    async def plan(self, message: str) -> ComparePlan:
+    async def plan(
+        self,
+        message: str,
+        *,
+        history: list[dict] | None = None,
+        summary: str | None = None,
+    ) -> ComparePlan:
         text = (message or "").strip()
         if not text:
             return ComparePlan(targets=[], raw_segments=[])
 
         rule = self._rule_plan(text)
-        if len(rule.targets) >= 2:
+        # 关键：当用户用指代代词（"刚才推荐的"/"你说的那两款"），即使规则切出了 ≥2 段，
+        # 也要走 LLM 兜底从 history/summary 抓 product_id —— 规则切出来的可能是
+        # "刚才推荐的 两款洗面奶" 这种无用 fragment。
+        has_referring_phrase = _has_referring_phrase(text)
+        if len(rule.targets) >= 2 and not has_referring_phrase:
             return rule
 
-        # 规则拆不出 ≥2 段 → 调 LLM
+        # 规则拆不出 ≥2 段 / 或者句子有指代代词 → 调 LLM 带 history+summary
         if self.llm is None:
-            return ComparePlan(targets=[text], raw_segments=rule.raw_segments)
+            return ComparePlan(
+                targets=rule.targets if len(rule.targets) >= 2 else [text],
+                raw_segments=rule.raw_segments,
+            )
 
         try:
-            llm_targets = await self._llm_split(text)
+            llm_targets = await self._llm_split(text, history=history, summary=summary)
         except Exception as exc:  # noqa: BLE001
             logger.warning("CompareTargetExtractor LLM 兜底失败：%s", exc)
-            return ComparePlan(targets=[text], raw_segments=rule.raw_segments)
+            return ComparePlan(
+                targets=rule.targets if len(rule.targets) >= 2 else [text],
+                raw_segments=rule.raw_segments,
+            )
 
         targets = [t for t in llm_targets if isinstance(t, str) and t.strip()]
         if len(targets) >= 2:
             return ComparePlan(targets=targets, raw_segments=rule.raw_segments, used_llm=True)
-        return ComparePlan(targets=[text], raw_segments=rule.raw_segments)
+        # LLM 也兜不下来：用规则结果或退回整句
+        return ComparePlan(
+            targets=rule.targets if len(rule.targets) >= 2 else [text],
+            raw_segments=rule.raw_segments,
+        )
 
     # ---- rule path ----
 
@@ -155,10 +183,22 @@ class CompareTargetExtractor:
 
     # ---- LLM path ----
 
-    async def _llm_split(self, text: str) -> list[str]:
+    async def _llm_split(
+        self,
+        text: str,
+        *,
+        history: list[dict] | None = None,
+        summary: str | None = None,
+    ) -> list[str]:
+        context_block = _format_context_block(history, summary)
+        user_msg = (
+            f"{context_block}"
+            f"用户输入：{text}\n"
+            "请输出 JSON。"
+        )
         messages = [
             {"role": "system", "content": self._SYSTEM_PROMPT},
-            {"role": "user", "content": text},
+            {"role": "user", "content": user_msg},
         ]
         result = await self.llm.chat_json(messages)  # type: ignore[union-attr]
         raw = result.get("targets") or []
@@ -195,6 +235,37 @@ def _extract_trailing_modifier(segment: str) -> str:
     if not m:
         return ""
     return m.group(1)
+
+
+# ---- 指代代词检测 ----
+
+_REFERRING_PHRASES: tuple[str, ...] = (
+    "刚才推荐", "刚刚推荐", "你推荐的", "你说的那", "前面那", "上面那",
+    "刚才那", "刚刚那", "你刚才", "你刚刚", "之前推荐", "之前的那",
+)
+
+
+def _has_referring_phrase(text: str) -> bool:
+    return any(p in text for p in _REFERRING_PHRASES)
+
+
+def _format_context_block(history: list[dict] | None, summary: str | None) -> str:
+    """summary + 最近几轮 history 拼成 LLM 上下文（与 query_rewriter 同形态）。"""
+    parts: list[str] = []
+    if summary and summary.strip():
+        parts.append(f"用户偏好概述（含已推荐的 product_id）：\n{summary.strip()[:200]}")
+    if history:
+        recent: list[str] = []
+        for m in history[-6:]:
+            role = m.get("role")
+            content = (m.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                recent.append(f"{role}: {content[:100]}")
+        if recent:
+            parts.append("对话历史（最近几轮，含 product_id 时请抓出来）：\n" + "\n".join(recent))
+    if not parts:
+        return ""
+    return "\n\n".join(parts) + "\n\n"
 
 
 def build_compare_extractor(*, llm: _LLMJSON | None = None) -> CompareTargetExtractor:

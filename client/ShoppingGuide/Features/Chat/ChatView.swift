@@ -112,6 +112,10 @@ struct ChatView: View {
 
     // MARK: - Message list
 
+    /// 空状态的 scroll anchor id：新建会话后用它把 ScrollView 滚回顶。
+    /// 否则上一轮长对话滚到底部的 contentOffset 残留，空状态会被定位到屏幕外。
+    private static let emptyStateAnchorID = "PriceCat.emptyState"
+
     private var messageList: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -119,6 +123,7 @@ struct ChatView: View {
                     if viewModel.messages.isEmpty {
                         emptyState
                             .padding(.top, 40)
+                            .id(Self.emptyStateAnchorID)
                     }
                     ForEach(viewModel.messages) { msg in
                         MessageBubble(message: msg) { option in
@@ -138,7 +143,14 @@ struct ChatView: View {
                     }
                 }
             }
-            .onChange(of: viewModel.messages.count) { _, _ in
+            .onChange(of: viewModel.messages.count) { oldCount, newCount in
+                // 新建会话：count 从 >0 变 0 → 把 ScrollView 滚回 emptyState 顶部
+                if newCount == 0 && oldCount > 0 {
+                    withAnimation(.easeOut(duration: 0.18)) {
+                        proxy.scrollTo(Self.emptyStateAnchorID, anchor: .top)
+                    }
+                    return
+                }
                 if let last = viewModel.messages.last {
                     proxy.scrollTo(last.id, anchor: .bottom)
                 }

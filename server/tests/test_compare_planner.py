@@ -113,6 +113,38 @@ async def test_llm_skipped_when_rules_sufficient():
 
 
 @pytest.mark.asyncio
+async def test_referring_phrase_triggers_llm_with_context():
+    """phase 4-4 实测轮 8：'对比刚才推荐的两款' 必须从 history/summary 抓 product_id。"""
+    fake = _FakeLLM(payload={"targets": ["p_beauty_011", "p_beauty_018"]})
+    ext = build_compare_extractor(llm=fake)
+    summary = "用户已被推荐 p_beauty_011（珊珂）和 p_beauty_018（The Ordinary）"
+    history = [
+        {"role": "assistant", "content": "为你推荐 p_beauty_011 珊珂洗面奶..."},
+    ]
+    plan = await ext.plan(
+        "对比刚才推荐的两款洗面奶", history=history, summary=summary,
+    )
+    # LLM 必须被调用一次（指代代词触发）
+    assert fake.calls == 1
+    assert plan.used_llm
+    assert plan.targets == ["p_beauty_011", "p_beauty_018"]
+
+
+@pytest.mark.asyncio
+async def test_referring_phrase_overrides_rule_split():
+    """即使规则切出了 fragment，含指代代词时也要走 LLM 兜底。"""
+    fake = _FakeLLM(payload={"targets": ["p_a", "p_b"]})
+    ext = build_compare_extractor(llm=fake)
+    # 规则可能切出 "对比刚才推荐的 两款洗面奶" 之类的废 fragment
+    plan = await ext.plan(
+        "对比 刚才推荐的两款 和 那个 洗面奶",
+        history=[{"role": "user", "content": "想要洗面奶"}],
+        summary="已推荐 p_a / p_b",
+    )
+    assert fake.calls == 1  # LLM 还是被调
+
+
+@pytest.mark.asyncio
 async def test_llm_failure_falls_back_to_original_message():
     fake = _FakeLLM(payload=None, raise_exc=TimeoutError("ark down"))
     ext = build_compare_extractor(llm=fake)

@@ -105,3 +105,41 @@ def test_retrieved_product_is_dataclass():
         base_price=10.0, best_chunk_text="t", supporting_chunks=["t"],
     )
     assert p.product_id == "p_x"
+    assert p.title == ""  # 默认空，title chunk 命中后会填
+
+
+def test_title_extracted_from_title_chunk():
+    """Phase 4 收尾：对比表头不再用 product_id，需要从 title chunk 抽商品名。"""
+    store = _FakeStore([
+        _mk_hit(
+            "p_a", 0.95, "title",
+            "兰蔻小黑瓶全新精华肌底液修护维稳细腻毛孔提亮肤色30ml | 品牌：兰蔻 | 类目：精华",
+        ),
+    ])
+    retriever = RagRetriever(embedder=_FakeEmbedder(), store=store)
+    products = retriever.search("query")
+    assert products[0].title.startswith("兰蔻小黑瓶")
+    # 不能包含分隔符后的部分（防止把"品牌：兰蔻 | 类目：..."也算进 title）
+    assert " | 品牌：" not in products[0].title
+
+
+def test_title_empty_when_only_description_chunk():
+    """只命中 description chunk 时 title 为空，prompt 端用 brand 兜底。"""
+    store = _FakeStore([
+        _mk_hit("p_a", 0.9, "description", "这是一段商品描述..."),
+    ])
+    retriever = RagRetriever(embedder=_FakeEmbedder(), store=store)
+    products = retriever.search("query")
+    assert products[0].title == ""
+
+
+def test_title_filled_by_later_title_chunk_when_best_is_other_type():
+    """best chunk 是 description，但后续 title chunk 也要把 title 字段补上。"""
+    store = _FakeStore([
+        _mk_hit("p_a", 0.95, "description", "描述文本"),
+        _mk_hit("p_a", 0.80, "title", "雅诗兰黛特润修护肌活精华露30ml | 品牌：雅诗兰黛 | 类目：精华"),
+    ])
+    retriever = RagRetriever(embedder=_FakeEmbedder(), store=store)
+    p = retriever.search("query")[0]
+    assert p.best_chunk_type == "description"
+    assert p.title.startswith("雅诗兰黛")
