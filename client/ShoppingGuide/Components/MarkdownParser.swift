@@ -22,10 +22,17 @@ public enum MarkdownParser {
     public static func parse(_ text: String) -> [MarkdownBlock] {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
 
-        // 归一化换行
-        let normalized = text
+        // 归一化换行 + PriceCat 衢线 serif 字体（New York）没有 emoji glyph，
+        // emoji 会渲染为 tofu 方块。服务端 prompt 已禁用 emoji；这里客户端兜底
+        // 过滤一道，防 LLM 不听 prompt 或漏网 emoji 进来。
+        var normalized = text
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
+        normalized = stripEmoji(normalized)
+        // strip emoji 后可能留下 "👉 阿迪..." → " 阿迪..." 这种前导空格，
+        // 同时把连续多空格压回单空格，保持版式干净
+        normalized = normalized
+            .replacingOccurrences(of: "  ", with: " ")
 
         // **行级扫描**：LLM 经常把段落和表格只用单 \n 连起来（不是 GFM 标准的
         // 空行分隔），如果按 \n\n 切块就识别不到。这里改成边走边切换状态。
@@ -153,6 +160,41 @@ public enum MarkdownParser {
         if t.hasSuffix("|") { t.removeLast() }
         return t.split(separator: "|", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    // MARK: - Emoji strip
+
+    /// 过滤 emoji 字符（含主 emoji + ZWJ 连接符 + 肤色修饰 + Variation Selector），
+    /// 同时也带过空格但跳过常见非 emoji 的特殊符号（如 © ® ™ § 这些 PriceCat 编辑文风
+    /// 可能用到的）。
+    ///
+    /// 判定：grapheme cluster 含任意 emoji presentation scalar 或落在 emoji block 内即去掉。
+    /// 这里采用「严过滤」——文风上 PriceCat 本就不该出 emoji，宁可多去几个也别留下方块。
+    static func stripEmoji(_ s: String) -> String {
+        var out = ""
+        out.reserveCapacity(s.count)
+        for ch in s {
+            if isEmojiCluster(ch) { continue }
+            out.append(ch)
+        }
+        return out
+    }
+
+    private static func isEmojiCluster(_ ch: Character) -> Bool {
+        for scalar in ch.unicodeScalars {
+            let v = scalar.value
+            // Emoji presentation：默认就是 emoji 显示（如 👉 ✅）
+            if scalar.properties.isEmojiPresentation { return true }
+            // U+1F000+ 是 Unicode emoji 主要分区
+            if v >= 0x1F000 && v <= 0x1FFFF { return true }
+            // U+2600-U+27BF Misc Symbols / Dingbats，含 ✅ ✨ ❤ ☑ 等
+            // 仅在 isEmoji 时算（避免误伤 © ® ™ 这类商标符）
+            if v >= 0x2600 && v <= 0x27BF && scalar.properties.isEmoji { return true }
+            // ZWJ + Variation Selector + 肤色修饰：单独出现也无意义，一并去掉
+            if v == 0x200D || v == 0xFE0E || v == 0xFE0F { return true }
+            if v >= 0x1F3FB && v <= 0x1F3FF { return true }
+        }
+        return false
     }
 
     // MARK: - Inline

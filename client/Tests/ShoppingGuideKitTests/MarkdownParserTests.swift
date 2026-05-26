@@ -136,4 +136,68 @@ struct MarkdownParserTests {
         #expect(MarkdownParser.parse("").isEmpty)
         #expect(MarkdownParser.parse("   \n\n\n   ").isEmpty)
     }
+
+    // MARK: - Emoji strip（PriceCat 衢线 serif 字体下 emoji 会渲染为方块）
+
+    @Test func stripsCommonEmojiFromLLMOutput() {
+        // 实测从 LLM smoke 拿到的 "👉 阿迪..." / "✅ 耐克..." 格式
+        let md = """
+        给你推荐两款跑鞋：
+        👉 阿迪达斯 Ultraboost 5：缓震出色
+        ✅ 耐克 Air Zoom Pegasus 41：日常通勤
+        """
+        let blocks = MarkdownParser.parse(md)
+        guard case let .paragraph(text) = blocks.last else { Issue.record("expected paragraph"); return }
+        let rendered = String(text.characters)
+        #expect(!rendered.contains("👉"))
+        #expect(!rendered.contains("✅"))
+        // 文字内容必须保留
+        #expect(rendered.contains("阿迪达斯") || rendered.contains("耐克"))
+    }
+
+    @Test func stripsBroadEmojiRange() {
+        // 覆盖几个常见 LLM 爱用的 emoji
+        let cases: [String] = ["🔥 火爆款", "⭐ 推荐", "💯 性价比", "🎉 限时", "✨ 新品"]
+        for s in cases {
+            let blocks = MarkdownParser.parse(s)
+            guard case let .paragraph(text) = blocks[0] else { Issue.record("expected paragraph for \(s)"); return }
+            let rendered = String(text.characters)
+            // emoji 字符已被剥离
+            for scalar in s.unicodeScalars where scalar.properties.isEmojiPresentation {
+                #expect(!rendered.unicodeScalars.contains(scalar))
+            }
+            // 文字仍保留
+            #expect(rendered.contains("款") || rendered.contains("推荐") || rendered.contains("性价比") ||
+                    rendered.contains("限时") || rendered.contains("新品"))
+        }
+    }
+
+    @Test func preservesNonEmojiSymbols() {
+        // 商标 / 货币 / 标点等不该被误伤
+        let md = "苹果 ®  价格 ¥1399 © 2026"
+        let blocks = MarkdownParser.parse(md)
+        guard case let .paragraph(text) = blocks[0] else { Issue.record("expected paragraph"); return }
+        let rendered = String(text.characters)
+        #expect(rendered.contains("®"))
+        #expect(rendered.contains("¥1399"))
+        #expect(rendered.contains("©"))
+    }
+
+    @Test func stripsTrailingEmojiInTableCell() {
+        // emoji 出现在表格单元格里也要剥
+        let md = """
+        | 商品 | 状态 |
+        | --- | --- |
+        | A | 🔥 |
+        | B | 在售 |
+        """
+        let blocks = MarkdownParser.parse(md)
+        guard case let .table(_, rows) = blocks[0] else { Issue.record("expected table"); return }
+        let allCells = rows.flatMap { $0 }
+        for cell in allCells {
+            for scalar in cell.unicodeScalars {
+                #expect(!scalar.properties.isEmojiPresentation)
+            }
+        }
+    }
 }
