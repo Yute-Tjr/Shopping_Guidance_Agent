@@ -17,6 +17,7 @@ import logging
 from typing import Any, AsyncIterator, Protocol
 
 from app.agent.card_extractor import ProductCardExtractor
+from app.agent.compare_planner import CompareTargetExtractor
 from app.agent.intent import IntentRouter
 from app.agent.memory import ConversationMemory
 from app.agent.prompts import build_compare_messages, build_recommend_messages
@@ -56,6 +57,7 @@ class AgentOrchestrator:
         memory: ConversationMemory,
         intent_router: IntentRouter | None = None,
         query_rewriter: QueryRewriter | None = None,
+        compare_extractor: CompareTargetExtractor | None = None,
     ) -> None:
         self.retriever = retriever
         self.llm = llm
@@ -65,6 +67,8 @@ class AgentOrchestrator:
         # query_rewriter 缺省时按"identity rewriter"用：保留 search_query 原文、不抽 filter，
         # 便于 phase 2 旧测试不变更直接通过。
         self.query_rewriter = query_rewriter
+        # compare_extractor 缺省时 compare 分支退化为整句一次性检索（phase 2 行为）。
+        self.compare_extractor = compare_extractor
 
     async def orchestrate(self, req: ChatRequest) -> AsyncIterator[dict]:
         session = self.memory.get_or_create(req.session_id)
@@ -93,11 +97,19 @@ class AgentOrchestrator:
         filter_expr = parsed.to_filter_expr()
         if filter_expr:
             logger.info("Milvus filter_expr=%s, search_query=%s", filter_expr, parsed.search_query)
-        retrieved = self.retriever.search(parsed.search_query, filter_expr=filter_expr)
-        # 命中为空时降级：去掉 filter 再来一次，避免"啥也搜不到"的死路（用户体验优先）
-        if not retrieved and filter_expr:
-            logger.info("filter 过严命中 0 条，去除过滤兜底再检索")
-            retrieved = self.retriever.search(parsed.search_query)
+        if intent.intent == "compare":
+            # Phase 4-2：compare 分支拆 targets 并行检索，保证 2-3 件代表商品都进 prompt
+            retrieved = await self._compare_retrieve(
+                original_query=intent.search_query,
+                rewritten=parsed.search_query,
+                filter_expr=filter_expr,
+            )
+        else:
+            retrieved = self.retriever.search(parsed.search_query, filter_expr=filter_expr)
+            # 命中为空时降级：去掉 filter 再来一次，避免"啥也搜不到"的死路（用户体验优先）
+            if not retrieved and filter_expr:
+                logger.info("filter 过严命中 0 条，去除过滤兜底再检索")
+                retrieved = self.retriever.search(parsed.search_query)
 
         # 3) 生成
         yield {"event": "status", "data": {"stage": "generating"}}
@@ -155,6 +167,61 @@ class AgentOrchestrator:
         # 4) 收尾：写 memory + done
         self.memory.save_turn(session.id, req.message, full_visible, emitted_card_ids)
         yield {"event": "done", "data": {"finish_reason": "stop"}}
+
+    async def _compare_retrieve(
+        self,
+        *,
+        original_query: str,
+        rewritten: str,
+        filter_expr: str | None,
+    ) -> list[RetrievedProduct]:
+        """compare 分支专用：每个 target 各 Top-2，合并去重最多 3 件塞 prompt。
+
+        没接 extractor 或拆不出 ≥2 个 target → 退化成整句一次性检索。
+        合并后 < 2 件时去掉 filter 兜底再来一次（避免 filter 太严卡住对比）。
+        """
+        # 没接 extractor 直接走整句
+        if self.compare_extractor is None:
+            retrieved = self.retriever.search(rewritten, filter_expr=filter_expr)
+            if not retrieved and filter_expr:
+                retrieved = self.retriever.search(rewritten)
+            return retrieved
+
+        try:
+            plan = await self.compare_extractor.plan(original_query)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("compare 拆 target 异常，整句兜底：%s", exc)
+            plan = None
+
+        targets: list[str] = []
+        if plan is not None and len(plan.targets) >= 2:
+            targets = plan.targets[:3]
+            logger.info("compare targets=%s", targets)
+        if not targets:
+            retrieved = self.retriever.search(rewritten, filter_expr=filter_expr)
+            if not retrieved and filter_expr:
+                retrieved = self.retriever.search(rewritten)
+            return retrieved
+
+        # 对每个 target 各 retrieve，按命中顺序保留首次出现的 product
+        merged: dict[str, RetrievedProduct] = {}
+        for tgt in targets:
+            hits = self.retriever.search(tgt, top_n_products=2, filter_expr=filter_expr)
+            for p in hits:
+                merged.setdefault(p.product_id, p)
+        # 合起来不足 2 件时去掉 filter 重试，避免对比一边查不到
+        if len(merged) < 2 and filter_expr:
+            for tgt in targets:
+                for p in self.retriever.search(tgt, top_n_products=2):
+                    merged.setdefault(p.product_id, p)
+        # 仍不足 → 整句兜底
+        if len(merged) < 2:
+            for p in self.retriever.search(rewritten):
+                merged.setdefault(p.product_id, p)
+                if len(merged) >= 3:
+                    break
+        # 最多 3 件，保证 prompt 不爆 + LLM 表格不超宽
+        return list(merged.values())[:3]
 
     async def _rewrite(self, search_query: str) -> ParsedQuery:
         """没接 rewriter 就返回 identity ParsedQuery（保 Phase 2 行为）。"""

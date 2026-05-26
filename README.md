@@ -68,7 +68,7 @@ cd ./client
 - [x] **Phase 3**：iOS 客户端最小闭环 ([详情](#phase-3-ios-客户端最小闭环))
 - [ ] **Phase 4**：对话能力增强（多轮 / 反选 / 对比） — 进行中
   - [x] 子项 1：Query Rewriter + 结构化筛选 + 反选与排除 ([详情](#phase-4-1-query-rewriter--反选与排除)，[评测报告](docs/phase4_eval_report.md))
-  - [ ] 子项 2：多商品对比
+  - [x] 子项 2：多商品对比（CompareTargetExtractor + 并行检索 + GFM 表格 Prompt）([详情](#phase-4-2-多商品对比))
   - [ ] 子项 3：主动澄清（信息不足触发 chips）
   - [ ] 子项 4：多轮 memory 摘要压缩
 - [ ] Phase 5：加分项（业务闭环 / 多模态 / 性能）
@@ -502,6 +502,73 @@ python -m scripts.eval_recall --with-rewriter rules
 
 # 4. rewriter LLM 版（需 ARK_API_KEY；q16 走 LLM 抽取）
 python -m scripts.eval_recall --with-rewriter llm --output ../docs/phase4_eval_report.md
+```
+
+---
+
+## Phase 4-2 多商品对比
+
+补齐 Phase 2 `compare` 意图分支：用户问「对比 A 和 B 哪个更 X」时，从单句拆出 2-3 个独立检索 target 各自跑一遍 retrieve，合并去重后塞 prompt；LLM 按 GFM Markdown 表格输出对比维度，前端（phase3 已就位的 MarkdownView）直接渲染。
+
+### (a) 模块分层
+
+| 文件 | 实现 |
+| --- | --- |
+| [`server/app/agent/compare_planner.py`](server/app/agent/compare_planner.py) | `CompareTargetExtractor` 双路径：**规则 fast-path**（识别 `对比/比较/比一比/vs/VS` 触发词 → 砍尾部 `哪个更XXX/哪款更XXX/呢/吗` → 按 `和/与/跟/、` 切两段 → 公共修饰回灌：`兰蔻和雅诗兰黛的精华` 中"的精华"补给前段、尾部疑问关键词"保湿"补给所有段）+ **LLM JSON 兜底**（规则切不出 ≥2 段时调 `chat_json` 抽 `{"targets":[...]}`）；失败兜底返回 `[原文]` 让 orchestrator 退化整句检索 |
+| [`server/app/agent/orchestrator.py`](server/app/agent/orchestrator.py) | `_compare_retrieve()`：每个 target 各 `retriever.search(top_n_products=2)`，按命中顺序去重；合并 <2 件时去掉 filter 兜底；仍不足整句兜底；最多 3 件塞 prompt 防止 LLM 表格爆宽 |
+| [`server/app/agent/prompts.py`](server/app/agent/prompts.py) | `build_compare_messages` 加强：表头第一列固定 `对比维度`、其余列**必须填 retrieved_products 真实 product_id**、GFM 分隔行强约束、3-4 行维度（价格区间 / 关键卖点 / 适用场景）、表后空行写 ≤40 字总结句、最后照旧 product_cards 围栏 |
+| [`server/app/api/deps.py`](server/app/api/deps.py) | `get_compare_extractor` 单例工厂；orchestrator 装配时注入，缺省 None 时 compare 分支退化整句检索（Phase 2 行为） |
+
+### (b) 测试覆盖
+
+```
+server/tests/
+├── test_compare_planner.py   10 用例
+│   ├── 规则路径 × 7   (和/与/跟连接、vs、3 目标、无触发词不切、空输入、剥尾部疑问、公共修饰回灌)
+│   └── LLM 兜底 × 3   (规则失败触发 / 规则够用不触发 / LLM 异常不挂)
+└── test_orchestrator.py 新增 1 用例：compare 分支真的调 extractor + 对每个 target 各 retrieve 一次 + token 流含 markdown 表头
+```
+
+服务端测试 79 → **90 全过**（含 phase4-1 的 79 条）。
+
+### (c) Phase 4-2 端到端实测
+
+```bash
+bash scripts/smoke_chat.sh "对比一下兰蔻和雅诗兰黛的精华哪个更保湿"
+```
+
+LLM 实际输出（节选 token 拼接后的可见正文）：
+
+```markdown
+| 对比维度 | p_beauty_002 | p_beauty_001 |
+| --- | --- | --- |
+| 价格区间 | ￥760.00 - ￥1480.00 | ￥720.00 - ￥1260.00 |
+| 关键卖点 | 修护维稳细腻毛孔提亮 | 淡纹紧致保湿夜间修护 |
+| 适用场景 | 换季敏感初抗老人群 | 夜间修护抗初老人群 |
+
+p_beauty_001 雅诗兰黛小棕瓶主打保湿功效，更适配你的保湿需求，价格更低。
+```
+
+紧接着两张 `product_card` 事件：`p_beauty_002`（兰蔻小黑瓶）+ `p_beauty_001`（雅诗兰黛小棕瓶），价格 / 标题 / image_url / SKU 全部从 MySQL hydrate；iOS 端 `MarkdownView` 自动把表格独占消息列全宽渲染（phase3 已支持，无需改客户端）。
+
+### (d) 与 Phase 3 前端的衔接
+
+- `MarkdownParser` 严格 + 宽松模式都能识别这套表格（[`test paragraphAndTableSeparatedBySingleNewline`](client/Tests/ShoppingGuideKitTests/MarkdownParserTests.swift) 覆盖）；
+- `MessageBubble` 按 markdown block 拆分时表格独占全宽、段落进气泡（[`test parsesTableSurroundedByParagraphs`](client/Tests/ShoppingGuideKitTests/MarkdownParserTests.swift) 覆盖）；
+- 不需要客户端任何改动，phase3 的衢线 editorial 视觉直接接住 phase4-2 的对比表格场景。
+
+### Phase 4-2 复跑指令
+
+```bash
+cd server && source .venv/bin/activate
+
+# 1. 单测
+python -m pytest tests/test_compare_planner.py tests/test_orchestrator.py -v
+
+# 2. 端到端 SSE
+uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+bash scripts/smoke_chat.sh "对比一下兰蔻和雅诗兰黛的精华哪个更保湿"
+bash scripts/smoke_chat.sh "iPhone 17 vs 华为 Pura 90"
 ```
 
 ---

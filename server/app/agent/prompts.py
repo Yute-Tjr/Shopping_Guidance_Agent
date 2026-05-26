@@ -98,12 +98,28 @@ def build_compare_messages(
     retrieved: Iterable[RetrievedProduct],
     history: list[dict] | None,
 ) -> list[dict]:
-    """商品对比 prompt：在 base 规则上追加表格 / 维度结构化要求。"""
-    compare_rules = """\n额外的对比任务要求：
-- 用一个简短的 Markdown 表格做横向对比，列 = 商品 ID，行 = 关键维度（如 价格区间 / 适用场景 / 关键卖点）；
-- 维度由你结合命中片段总结，不超过 4 行；
-- 表格之后给一句 ≤ 30 字的总结推荐；
-- 最后照例追加 product_cards 围栏。"""
+    """商品对比 prompt：在 base 规则上追加表格 / 维度结构化要求。
+
+    Phase 4-2：把 Markdown 表格规则进一步收紧，让 iOS 端的 MarkdownParser 一定能识别：
+    - 表头第一列固定 = 「对比维度」；其余列 = product_id（必须来自 retrieved_products）；
+    - 第二行 = GFM 分隔行 `| --- | --- | --- |`；
+    - 数据行 = 3-4 行关键维度（价格 / 关键卖点 / 适用人群或场景）；
+    - 表格之后空行，再写 ≤ 40 字总结句，最后照旧 product_cards 围栏。
+    """
+    compare_rules = """\n额外的对比任务要求（必须遵守，否则前端展示会失败）：
+1. 当 retrieved_products 中有 ≥2 件商品时，**必须**输出一个 Markdown 表格做横向对比；
+2. 表格格式必须严格如下（GFM 标准，含分隔行）：
+
+| 对比维度 | <product_id_1> | <product_id_2> |
+| --- | --- | --- |
+| 价格区间 | <从 retrieved 取> | <从 retrieved 取> |
+| 关键卖点 | <8-15 字总结> | <8-15 字总结> |
+| 适用场景 | <8-15 字总结> | <8-15 字总结> |
+
+3. 表头第一列固定写「对比维度」，其余列**必须填 retrieved_products 中真实存在的 product_id**；
+4. 数据行 3-4 行；价格区间直接从 retrieved 给出的「价格=￥a - ￥b」原样填；其它维度结合命中片段提炼；
+5. 表格之后**空一行**，再写 ≤ 40 字的总结句（先把更适合的那款 product_id 点出来）；
+6. 最后照例追加 product_cards 围栏，把对比涉及的所有 product_id 都列进去。"""
     system_parts = [_BASE_RULES + compare_rules, "", _format_retrieved_block(retrieved)]
     msgs: list[dict] = [{"role": "system", "content": "\n".join(system_parts)}]
     msgs.extend(_history_messages(history))

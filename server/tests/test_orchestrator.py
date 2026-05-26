@@ -193,6 +193,62 @@ async def test_llm_failure_falls_back_to_top_products():
         assert pid in {"p_a", "p_b", "p_c"}
 
 
+class _FakeCompareExtractor:
+    """Fake CompareTargetExtractor，记录调用次数 + 返回固定 targets。"""
+
+    def __init__(self, targets):
+        from app.agent.compare_planner import ComparePlan
+        self._plan = ComparePlan(targets=list(targets), raw_segments=list(targets))
+        self.calls = 0
+
+    async def plan(self, message: str):
+        self.calls += 1
+        return self._plan
+
+
+@pytest.mark.asyncio
+async def test_compare_intent_runs_per_target_retrieval():
+    """compare 意图：拆出 N 个 target，每个 target 各 retrieve 一次，合并去重塞 prompt。"""
+    # 三件商品，模拟两边对比能各拉到 1 件
+    retr = _FakeRetriever([_product("p_a"), _product("p_b"), _product("p_c")])
+    repo = _FakeProductRepo()
+    extractor = _FakeCompareExtractor(targets=["兰蔻 精华 保湿", "雅诗兰黛 精华 保湿"])
+    llm_tokens = [
+        "| 对比维度 | p_a | p_b |\n",
+        "| --- | --- | --- |\n",
+        "| 价格 | ￥79-129 | ￥79-129 |\n\n",
+        "p_a 更适合敏感肌。\n",
+        "```product_cards\n",
+        '[{"product_id":"p_a","reason":"控油温和"},'
+        '{"product_id":"p_b","reason":"长效保湿"}]\n',
+        "```",
+    ]
+    orch = AgentOrchestrator(
+        retriever=retr,
+        llm=_FakeLLM(llm_tokens),
+        product_repo=repo,
+        memory=ConversationMemory(),
+        compare_extractor=extractor,
+    )
+    events = [
+        e async for e in orch.orchestrate(
+            ChatRequest(session_id=None, message="对比一下兰蔻和雅诗兰黛的精华哪个更保湿")
+        )
+    ]
+    kinds = [e["event"] for e in events]
+    # extractor 必须被调用过一次（拆 targets）
+    assert extractor.calls == 1
+    # retriever 至少被调 2 次（每个 target 一次）
+    assert len(retr.calls) >= 2
+    assert "兰蔻 精华 保湿" in retr.calls and "雅诗兰黛 精华 保湿" in retr.calls
+    # 输出至少含 product_card 与 done
+    assert "product_card" in kinds
+    assert kinds[-1] == "done"
+    # token 流里能看到 markdown 表格头
+    joined = "".join(e["data"]["text"] for e in events if e["event"] == "token")
+    assert "对比维度" in joined
+
+
 @pytest.mark.asyncio
 async def test_llm_hallucinated_product_id_dropped():
     """LLM 卡片输出了不在检索结果里的 product_id，必须被丢弃。"""

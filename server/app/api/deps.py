@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from app.agent.compare_planner import CompareTargetExtractor, build_compare_extractor
 from app.agent.memory import ConversationMemory, get_memory
 from app.agent.orchestrator import AgentOrchestrator
 from app.agent.query_rewriter import QueryRewriter, build_query_rewriter
@@ -32,6 +33,11 @@ def get_query_rewriter() -> QueryRewriter:
     return build_query_rewriter(llm=get_llm_client(), known_brands=[])
 
 
+@lru_cache(maxsize=1)
+def get_compare_extractor() -> CompareTargetExtractor:
+    return build_compare_extractor(llm=get_llm_client())
+
+
 def get_conversation_memory() -> ConversationMemory:
     return get_memory()
 
@@ -43,6 +49,7 @@ def get_orchestrator() -> AgentOrchestrator:
         product_repo=get_product_repository(),
         memory=get_conversation_memory(),
         query_rewriter=get_query_rewriter(),
+        compare_extractor=get_compare_extractor(),
     )
 
 
