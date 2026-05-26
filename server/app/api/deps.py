@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
+from app.agent.clarify_detector import ClarifyDetector, build_clarify_detector
 from app.agent.compare_planner import CompareTargetExtractor, build_compare_extractor
 from app.agent.memory import ConversationMemory, get_memory
 from app.agent.orchestrator import AgentOrchestrator
@@ -38,6 +39,11 @@ def get_compare_extractor() -> CompareTargetExtractor:
     return build_compare_extractor(llm=get_llm_client())
 
 
+@lru_cache(maxsize=1)
+def get_clarify_detector() -> ClarifyDetector:
+    return build_clarify_detector()
+
+
 def get_conversation_memory() -> ConversationMemory:
     return get_memory()
 
@@ -50,6 +56,7 @@ def get_orchestrator() -> AgentOrchestrator:
         memory=get_conversation_memory(),
         query_rewriter=get_query_rewriter(),
         compare_extractor=get_compare_extractor(),
+        clarify_detector=get_clarify_detector(),
     )
 
 

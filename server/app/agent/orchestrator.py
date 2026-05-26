@@ -17,6 +17,7 @@ import logging
 from typing import Any, AsyncIterator, Protocol
 
 from app.agent.card_extractor import ProductCardExtractor
+from app.agent.clarify_detector import ClarifyDetector
 from app.agent.compare_planner import CompareTargetExtractor
 from app.agent.intent import IntentRouter
 from app.agent.memory import ConversationMemory
@@ -58,6 +59,7 @@ class AgentOrchestrator:
         intent_router: IntentRouter | None = None,
         query_rewriter: QueryRewriter | None = None,
         compare_extractor: CompareTargetExtractor | None = None,
+        clarify_detector: ClarifyDetector | None = None,
     ) -> None:
         self.retriever = retriever
         self.llm = llm
@@ -69,6 +71,8 @@ class AgentOrchestrator:
         self.query_rewriter = query_rewriter
         # compare_extractor 缺省时 compare 分支退化为整句一次性检索（phase 2 行为）。
         self.compare_extractor = compare_extractor
+        # clarify_detector 缺省时直接跳过主动澄清判定（保 phase 2 行为）。
+        self.clarify_detector = clarify_detector
 
     async def orchestrate(self, req: ChatRequest) -> AsyncIterator[dict]:
         session = self.memory.get_or_create(req.session_id)
@@ -97,6 +101,26 @@ class AgentOrchestrator:
         filter_expr = parsed.to_filter_expr()
         if filter_expr:
             logger.info("Milvus filter_expr=%s, search_query=%s", filter_expr, parsed.search_query)
+
+        # 2.5) Phase 4-3 主动澄清：recommend 意图信息不足时短路 emit clarify + done，
+        # 不再走 LLM 推一台"瞎猜的"商品出来。
+        if intent.intent == "recommend" and self.clarify_detector is not None:
+            decision = self.clarify_detector.assess(
+                intent_name=intent.intent,
+                message=req.message,
+                parsed=parsed,
+            )
+            if decision is not None and decision.should_clarify:
+                yield {
+                    "event": "clarify",
+                    "data": {"question": decision.question, "options": decision.options},
+                }
+                # 这一轮不进 retrieve，也不算一次完整推荐，但要把 user message 写进 memory
+                # 方便下一轮用户点 chip 后能续上下文
+                self.memory.save_turn(session.id, req.message, "", [])
+                yield {"event": "done", "data": {"finish_reason": "stop"}}
+                return
+
         if intent.intent == "compare":
             # Phase 4-2：compare 分支拆 targets 并行检索，保证 2-3 件代表商品都进 prompt
             retrieved = await self._compare_retrieve(

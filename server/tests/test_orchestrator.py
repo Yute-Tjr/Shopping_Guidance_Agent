@@ -193,6 +193,40 @@ async def test_llm_failure_falls_back_to_top_products():
         assert pid in {"p_a", "p_b", "p_c"}
 
 
+@pytest.mark.asyncio
+async def test_recommend_with_clarify_detector_short_circuits_chips():
+    """Phase 4-3：「推荐一款手机」走 recommend 意图但信息不足，应短路 emit clarify。"""
+    from app.agent.clarify_detector import build_clarify_detector
+
+    retr = _FakeRetriever([_product("p_a")])
+    repo = _FakeProductRepo()
+    orch = AgentOrchestrator(
+        retriever=retr,
+        llm=_FakeLLM(["不该被调用"]),
+        product_repo=repo,
+        memory=ConversationMemory(),
+        clarify_detector=build_clarify_detector(),
+    )
+
+    events = [
+        e async for e in orch.orchestrate(
+            ChatRequest(session_id=None, message="推荐一款手机")
+        )
+    ]
+    kinds = [e["event"] for e in events]
+    assert "clarify" in kinds, f"应触发 clarify，实际事件流: {kinds}"
+    assert "token" not in kinds, "clarify 短路时不应进 LLM 流"
+    assert "product_card" not in kinds
+    assert kinds[-1] == "done"
+    # 不应调到 retriever
+    assert retr.calls == []
+    # clarify payload 必须给出 question + options
+    clarify = next(e for e in events if e["event"] == "clarify")
+    assert clarify["data"]["question"]
+    assert isinstance(clarify["data"]["options"], list)
+    assert len(clarify["data"]["options"]) >= 3
+
+
 class _FakeCompareExtractor:
     """Fake CompareTargetExtractor，记录调用次数 + 返回固定 targets。"""
 

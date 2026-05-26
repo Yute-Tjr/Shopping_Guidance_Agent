@@ -69,7 +69,7 @@ cd ./client
 - [ ] **Phase 4**：对话能力增强（多轮 / 反选 / 对比） — 进行中
   - [x] 子项 1：Query Rewriter + 结构化筛选 + 反选与排除 ([详情](#phase-4-1-query-rewriter--反选与排除)，[评测报告](docs/phase4_eval_report.md))
   - [x] 子项 2：多商品对比（CompareTargetExtractor + 并行检索 + GFM 表格 Prompt）([详情](#phase-4-2-多商品对比))
-  - [ ] 子项 3：主动澄清（信息不足触发 chips）
+  - [x] 子项 3：主动澄清（ClarifyDetector + 13 类目 chips 模板）([详情](#phase-4-3-主动澄清))
   - [ ] 子项 4：多轮 memory 摘要压缩
 - [ ] Phase 5：加分项（业务闭环 / 多模态 / 性能）
 - [ ] Phase 6：打磨与交付
@@ -569,6 +569,91 @@ python -m pytest tests/test_compare_planner.py tests/test_orchestrator.py -v
 uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 bash scripts/smoke_chat.sh "对比一下兰蔻和雅诗兰黛的精华哪个更保湿"
 bash scripts/smoke_chat.sh "iPhone 17 vs 华为 Pura 90"
+```
+
+---
+
+## Phase 4-3 主动澄清
+
+补齐 Phase 2 `IntentRouter.clarify_needed` 的语义维度——原版只挡得住字数 < 3 的极短输入（"嗯"/"x"），扛不住 `推荐一款手机` 这种 6 字符但语义极泛的 query。Phase 4-3 加一层「语义信息密度」判定，命中即短路 emit `clarify` event + 4 个 chips，由 phase3 已就位的 iOS `MessageBubble.clarifyChips` 直接渲染（**客户端零改动**）。
+
+### (a) 模块分层
+
+| 文件 | 实现 |
+| --- | --- |
+| [`server/app/agent/clarify_detector.py`](server/app/agent/clarify_detector.py) | `ClarifyDetector.assess(intent_name, message, parsed)` 规则版判定，输出 `ClarifyDecision(should_clarify, question, options, category_key)`。判定流程：① 必须是 recommend 意图；② `ParsedQuery` 里 price / brand_include / brand_exclude 全空（否则视为已有约束）；③ 剥掉「推荐/一款/给我/帮我/有什么」等 30+ 通用词后，剩余字符必须恰好等于某个大类目触发词；④ query 不含 50+ 具象修饰词白名单（"拍照""油皮""高倍""降噪""马拉松""无糖"等，命中任意一个即视为有信息）。模板覆盖 **13 个大类目**（手机/笔记本/耳机/跑鞋/篮球鞋/洗面奶/防晒/精华/面霜/饮料/咖啡/背包/零食），每个预置 4 个互斥 chips 选项；alias 反向索引让"笔记本电脑"/"电脑"都映射回"笔记本"模板 |
+| [`server/app/agent/orchestrator.py`](server/app/agent/orchestrator.py) | recommend 分支在 `query_rewriter` 之后、`retriever.search` 之前调 `clarify_detector.assess`；命中即 emit `clarify` + `done` 短路，**不进 LLM 流也不进 retrieve**（省 1 次 embedding + 1 次 LLM 流式调用）；user message 仍写进 memory，方便下一轮用户点 chip 后续上下文 |
+| [`server/app/api/deps.py`](server/app/api/deps.py) | `get_clarify_detector()` 单例工厂；缺省 None 时 orchestrator 跳过该判定（Phase 2 行为向后兼容） |
+
+### (b) 触发 / 不触发对照（设计原则：宁可漏不要误伤）
+
+| query | ParsedQuery | 判定 | 输出 |
+| --- | --- | --- | --- |
+| `推荐一款手机` | 全空 | **触发** | `想看哪种风格的手机？` + `[拍照优先 / 续航优先 / 性能旗舰 / 性价比优先]` |
+| `有什么耳机推荐` | 全空 | **触发** | `对耳机最看重什么？` + `[主动降噪 / 音质 HiFi / 长续航 / 百元平价]` |
+| `想买洗面奶` | 全空 | **触发** | `你的肤质偏向？` + `[油性皮肤 / 干性皮肤 / 敏感肌 / 混合肌]` |
+| `推荐一款拍照好的手机` | 含"拍照" hint | 跳过 | 正常 retrieve + LLM 流 |
+| `推荐一款适合油皮的洗面奶` | 含"油皮" hint | 跳过 | 正常流 |
+| `300 元以下的防晒霜` | `price_max=300` | 跳过 | 正常流 |
+| `国产手机推荐` | `brands_exclude=[...]` | 跳过 | 正常流（已在 phase 4-1 覆盖）|
+| `对比兰蔻和雅诗兰黛` | intent=compare | 跳过 | 走 phase 4-2 compare 分支 |
+| `推荐一辆汽车` | 全空但类目不在模板内 | 跳过 | 正常 retrieve（无对应商品时由 prompt 兜底"未找到"）|
+
+### (c) 测试覆盖
+
+```
+server/tests/
+├── test_clarify_detector.py    29 用例
+│   ├── 10 个类目触发 × parametrize   （手机/笔记本/耳机/跑鞋/洗面奶/防晒/零食/咖啡/背包等）
+│   ├── 具象修饰词反例 × 8 parametrize（拍照/油皮/长续航/降噪/马拉松/高倍/无糖/低价格）
+│   ├── ParsedQuery 已有约束反例 × 3   （price / brands_exclude / brands_include）
+│   ├── 非 recommend 意图反例 × 4      （compare / cart_op / clarify_needed / chitchat）
+│   ├── 边界 × 4                       （空串 / 仅空白 / 未知类目 / parsed=None）
+│   └── chips 互斥性 × 1
+└── test_orchestrator.py 新增 1 用例：recommend + 信息不足 → emit clarify + 不调 retriever + 不进 LLM 流
+```
+
+服务端测试 90 → **120 全过**（含 phase4-1 的 79 + phase4-2 的 11 + phase4-3 的 30）。
+
+### (d) Phase 4-3 端到端实测
+
+```bash
+bash scripts/smoke_chat.sh "推荐一款手机"
+```
+
+SSE 输出：
+
+```
+event: session   data: {"session_id": "..."}
+event: status    data: {"stage": "parsing"}
+event: status    data: {"stage": "retrieving"}
+event: clarify   data: {"question": "想看哪种风格的手机？",
+                        "options": ["拍照优先", "续航优先", "性能旗舰", "性价比优先"]}
+event: done      data: {"finish_reason": "stop"}
+```
+
+**没有 token 流也没有 product_card 事件** —— 短路成功，省一次 LLM 流式调用。
+
+反例 `bash scripts/smoke_chat.sh "推荐一款拍照好的手机"`：照常 token 流 + 商品卡片，证明 detector 不会误伤已有约束的 query。
+
+### (e) 与 Phase 3 前端的衔接
+
+phase3 的 `MessageBubble.clarifyChips` 早就把 chips 渲染做好了：浅橙 capsule + 品牌色描边 + 点击回填 input。**iOS 端零改动**，直接接住 phase4-3 的事件流。
+
+### Phase 4-3 复跑指令
+
+```bash
+cd server && source .venv/bin/activate
+
+# 1. 单测（29 detector + 1 orchestrator）
+python -m pytest tests/test_clarify_detector.py tests/test_orchestrator.py -v
+
+# 2. 端到端 SSE
+uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+bash scripts/smoke_chat.sh "推荐一款手机"             # 应触发 clarify
+bash scripts/smoke_chat.sh "推荐一款拍照好的手机"     # 不该触发，应正常推卡片
+bash scripts/smoke_chat.sh "想买洗面奶"               # 应触发 clarify
+bash scripts/smoke_chat.sh "推荐一款适合油皮的洗面奶" # 不该触发
 ```
 
 ---
