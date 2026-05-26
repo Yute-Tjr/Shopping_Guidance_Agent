@@ -76,6 +76,16 @@ class ProductRepository:
                 "reason": "",  # 由 orchestrator 拼上 LLM 给的理由
             }
 
+    async def list_brands(self) -> list[str]:
+        """库内所有品牌（去重，按字母序），给 QueryRewriter 注入 LLM 白名单用。
+
+        100 条数据规模下一次查询 ~25 行，启动期跑一次缓存即可，不必走 Redis。
+        """
+        async with self._sf() as session:
+            result = await session.execute(select(Product.brand).distinct())
+            rows = [r[0] for r in result.all() if r[0]]
+        return sorted(set(rows))
+
     async def get_detail(self, product_id: str) -> dict[str, Any] | None:
         """详情页用，比 card_view 多一份 raw_json + sub_category。"""
         async with self._sf() as session:

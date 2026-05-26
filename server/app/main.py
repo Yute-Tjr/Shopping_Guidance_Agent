@@ -31,6 +31,20 @@ async def lifespan(_: FastAPI):
         logger.info("MySQL 探活成功")
     except Exception as exc:  # noqa: BLE001
         logger.warning("MySQL 探活失败：%s。Phase 0 允许先把服务起来，请稍后确认 docker compose up -d。", exc)
+
+    # Phase 4: 把库内品牌列表一次性灌进 QueryRewriter，给 LLM JSON 抽取做白名单。
+    try:
+        from app.api.deps import get_query_rewriter
+        from app.db.product_repo import get_product_repository
+
+        repo = get_product_repository()
+        brands = await repo.list_brands()
+        rewriter = get_query_rewriter()
+        rewriter.set_known_brands(brands)
+        logger.info("已加载品牌列表给 QueryRewriter：%d 个", len(brands))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("加载品牌列表失败，QueryRewriter 走规则裸跑：%s", exc)
+
     yield
     await engine.dispose()
 

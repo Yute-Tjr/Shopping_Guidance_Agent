@@ -20,6 +20,7 @@ from app.agent.card_extractor import ProductCardExtractor
 from app.agent.intent import IntentRouter
 from app.agent.memory import ConversationMemory
 from app.agent.prompts import build_compare_messages, build_recommend_messages
+from app.agent.query_rewriter import ParsedQuery, QueryRewriter
 from app.rag.retriever import RetrievedProduct
 from app.schemas.chat import ChatRequest
 from app.utils.logger import get_logger
@@ -54,12 +55,16 @@ class AgentOrchestrator:
         product_repo: _ProductRepoLike,
         memory: ConversationMemory,
         intent_router: IntentRouter | None = None,
+        query_rewriter: QueryRewriter | None = None,
     ) -> None:
         self.retriever = retriever
         self.llm = llm
         self.product_repo = product_repo
         self.memory = memory
         self.intent_router = intent_router or IntentRouter()
+        # query_rewriter 缺省时按"identity rewriter"用：保留 search_query 原文、不抽 filter，
+        # 便于 phase 2 旧测试不变更直接通过。
+        self.query_rewriter = query_rewriter
 
     async def orchestrate(self, req: ChatRequest) -> AsyncIterator[dict]:
         session = self.memory.get_or_create(req.session_id)
@@ -82,9 +87,17 @@ class AgentOrchestrator:
             yield {"event": "done", "data": {"finish_reason": "stop"}}
             return
 
-        # 2) 检索
+        # 2) 检索（Phase 4：先 query_rewriter 抽干净 query + filter，再走向量召回 + metadata filter）
         yield {"event": "status", "data": {"stage": "retrieving"}}
-        retrieved = self.retriever.search(intent.search_query)
+        parsed = await self._rewrite(intent.search_query)
+        filter_expr = parsed.to_filter_expr()
+        if filter_expr:
+            logger.info("Milvus filter_expr=%s, search_query=%s", filter_expr, parsed.search_query)
+        retrieved = self.retriever.search(parsed.search_query, filter_expr=filter_expr)
+        # 命中为空时降级：去掉 filter 再来一次，避免"啥也搜不到"的死路（用户体验优先）
+        if not retrieved and filter_expr:
+            logger.info("filter 过严命中 0 条，去除过滤兜底再检索")
+            retrieved = self.retriever.search(parsed.search_query)
 
         # 3) 生成
         yield {"event": "status", "data": {"stage": "generating"}}
@@ -142,6 +155,16 @@ class AgentOrchestrator:
         # 4) 收尾：写 memory + done
         self.memory.save_turn(session.id, req.message, full_visible, emitted_card_ids)
         yield {"event": "done", "data": {"finish_reason": "stop"}}
+
+    async def _rewrite(self, search_query: str) -> ParsedQuery:
+        """没接 rewriter 就返回 identity ParsedQuery（保 Phase 2 行为）。"""
+        if self.query_rewriter is None:
+            return ParsedQuery(search_query=search_query)
+        try:
+            return await self.query_rewriter.parse(search_query)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("QueryRewriter.parse 异常，走原文检索：%s", exc)
+            return ParsedQuery(search_query=search_query)
 
     async def _hydrate_card(self, raw_card: dict) -> dict | None:
         """用 MySQL 仓库填字段，防止 LLM 编造价格 / 标题。"""

@@ -1,25 +1,29 @@
 """Top-K Recall 评测：把黄金集逐条 embed → Milvus search → 计算召回率。
 
 依据 docs/02 §9 指标：黄金集每条标 1-3 个 product_id，Top-K 命中视为该条召回成功。
-Phase 1 阶段不带 metadata 过滤（价格 / 品牌排除），纯语义向量召回——price_filter /
-brand_exclude 意图同样按"是否在 Top-K 出现金 ID"判定，过滤逻辑要等 Phase 2 query
-rewriter 落地后再单独评。
+
+两种评测模式：
+- baseline（Phase 1 默认）：纯语义向量召回，不带 metadata 过滤；
+- --with-rewriter [rules|llm]（Phase 4 新增）：先过 QueryRewriter 抽出
+  search_query + filter_expr，再走 Milvus 向量召回 + scalar 过滤；rules 模式
+  只跑规则（不调真实 LLM，离线可复现），llm 模式额外触发 LLM JSON 抽取。
 
 用法：
     cd server
-    python -m scripts.eval_recall                          # 跑全部 query
-    python -m scripts.eval_recall --top-k 5                # 只看 Top-5
-    python -m scripts.eval_recall --queries path/to.json   # 自定义黄金集
-    python -m scripts.eval_recall --output report.md       # 输出 Markdown 报告
+    python -m scripts.eval_recall                              # baseline
+    python -m scripts.eval_recall --with-rewriter rules        # Phase 4 规则版
+    python -m scripts.eval_recall --with-rewriter llm          # Phase 4 完整版（需 ARK API key）
+    python -m scripts.eval_recall --output report.md           # 输出 Markdown 报告
 """
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 from app.config import settings
 from app.rag.embedder import build_embedder_from_settings
@@ -112,14 +116,41 @@ def render_markdown_report(
     return "\n".join(lines)
 
 
+async def _load_rewriter(mode: str) -> Optional[object]:
+    """按 mode 装配 QueryRewriter；返回 None 表示走 baseline。"""
+    if mode == "off":
+        return None
+    from app.agent.query_rewriter import build_query_rewriter
+    from app.db.product_repo import ProductRepository
+
+    repo = ProductRepository()
+    try:
+        brands = await repo.list_brands()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MySQL 拉品牌失败，rewriter 走空白名单：%s", exc)
+        brands = []
+    llm = None
+    if mode == "llm":
+        from app.llm.doubao_client import build_chat_client_from_settings
+
+        llm = build_chat_client_from_settings()
+    return build_query_rewriter(llm=llm, known_brands=brands)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 1 检索召回评测")
+    parser = argparse.ArgumentParser(description="Phase 1/4 检索召回评测")
     parser.add_argument("--queries", type=Path, default=DEFAULT_GOLDSET)
     parser.add_argument("--top-k", type=int, action="append", default=None,
                         help="可重复指定，如 --top-k 1 --top-k 5；缺省 (1,3,5,10)")
     parser.add_argument("--output", type=Path, default=None,
                         help="把 Markdown 报告写到该文件；缺省只打印汇总")
     parser.add_argument("--verbose", action="store_true", help="打印每条 query 的 Top-3 命中详情")
+    parser.add_argument(
+        "--with-rewriter",
+        choices=("off", "rules", "llm"),
+        default="off",
+        help="Phase 4：是否先过 QueryRewriter 抽 filter；rules 离线规则版 / llm 走 Doubao JSON 抽取",
+    )
     args = parser.parse_args()
 
     top_ks = tuple(sorted(args.top_k)) if args.top_k else DEFAULT_TOP_KS
@@ -133,6 +164,10 @@ def main() -> None:
     store.ensure_collection()
     logger.info("Milvus collection 已加载（products_text, dim=%d）", dim)
 
+    rewriter = asyncio.run(_load_rewriter(args.with_rewriter))
+    if rewriter is not None:
+        logger.info("QueryRewriter mode=%s 已就位", args.with_rewriter)
+
     per_query: list[dict] = []
     hits_count: dict[int, int] = {k: 0 for k in top_ks}
     by_intent_hits: dict[str, dict[int, int]] = defaultdict(lambda: {k: 0 for k in top_ks})
@@ -140,9 +175,19 @@ def main() -> None:
 
     started = time.time()
     for entry in goldset:
-        qvec = embedder.embed_one(entry["query"])
-        hits = store.search(qvec, top_k=SEARCH_LIMIT)
+        search_query = entry["query"]
+        filter_expr: Optional[str] = None
+        if rewriter is not None:
+            parsed = asyncio.run(rewriter.parse(entry["query"]))
+            search_query = parsed.search_query or entry["query"]
+            filter_expr = parsed.to_filter_expr()
+        qvec = embedder.embed_one(search_query)
+        hits = store.search(qvec, top_k=SEARCH_LIMIT, filter_expr=filter_expr)
         ranked = dedupe_to_product_ids(hits)
+        # Filter 过严直接吃光命中时，去掉 filter 兜底再来一次（与 orchestrator 一致策略）
+        if not ranked and filter_expr:
+            hits = store.search(qvec, top_k=SEARCH_LIMIT)
+            ranked = dedupe_to_product_ids(hits)
         query_hits: dict[int, bool] = {}
         for k in top_ks:
             ok = hit_at_k(ranked, entry["gold"], k)
@@ -151,9 +196,13 @@ def main() -> None:
                 hits_count[k] += 1
                 by_intent_hits[entry["intent"]][k] += 1
         by_intent_total[entry["intent"]] += 1
-        per_query.append({**entry, "ranked": ranked, "hits": query_hits})
+        per_query.append({**entry, "ranked": ranked, "hits": query_hits,
+                          "search_query": search_query, "filter_expr": filter_expr})
         if args.verbose:
             print(f"[{entry['id']}] {entry['query']}")
+            if filter_expr:
+                print(f"  rewritten: {search_query!r}")
+                print(f"  filter   : {filter_expr}")
             print(f"  gold: {entry['gold']}")
             print(f"  top5: {ranked[:5]}")
             print(f"  hit@5: {query_hits[5]}")

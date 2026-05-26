@@ -10,6 +10,7 @@ from functools import lru_cache
 
 from app.agent.memory import ConversationMemory, get_memory
 from app.agent.orchestrator import AgentOrchestrator
+from app.agent.query_rewriter import QueryRewriter, build_query_rewriter
 from app.db.product_repo import ProductRepository, get_product_repository
 from app.llm.doubao_client import DoubaoChatClient, build_chat_client_from_settings
 from app.rag.retriever import RagRetriever, build_retriever_from_settings
@@ -25,6 +26,12 @@ def get_llm_client() -> DoubaoChatClient:
     return build_chat_client_from_settings()
 
 
+@lru_cache(maxsize=1)
+def get_query_rewriter() -> QueryRewriter:
+    # 启动时品牌列表为空，main.lifespan 会异步拉一次填进来。
+    return build_query_rewriter(llm=get_llm_client(), known_brands=[])
+
+
 def get_conversation_memory() -> ConversationMemory:
     return get_memory()
 
@@ -35,6 +42,7 @@ def get_orchestrator() -> AgentOrchestrator:
         llm=get_llm_client(),
         product_repo=get_product_repository(),
         memory=get_conversation_memory(),
+        query_rewriter=get_query_rewriter(),
     )
 
 

@@ -66,7 +66,11 @@ cd ./client
 - [x] **Phase 1**：数据工程与向量索引 ([详情](#phase-1-数据工程与向量索引)，[评测报告](docs/phase1_eval_report.md))
 - [x] **Phase 2**：后端最小闭环 ([详情](#phase-2-后端最小闭环))
 - [x] **Phase 3**：iOS 客户端最小闭环 ([详情](#phase-3-ios-客户端最小闭环))
-- [ ] Phase 4：对话能力增强（多轮 / 反选 / 对比）
+- [ ] **Phase 4**：对话能力增强（多轮 / 反选 / 对比） — 进行中
+  - [x] 子项 1：Query Rewriter + 结构化筛选 + 反选与排除 ([详情](#phase-4-1-query-rewriter--反选与排除)，[评测报告](docs/phase4_eval_report.md))
+  - [ ] 子项 2：多商品对比
+  - [ ] 子项 3：主动澄清（信息不足触发 chips）
+  - [ ] 子项 4：多轮 memory 摘要压缩
 - [ ] Phase 5：加分项（业务闭环 / 多模态 / 性能）
 - [ ] Phase 6：打磨与交付
 
@@ -306,13 +310,22 @@ curl -s http://127.0.0.1:8000/api/v1/products/p_beauty_011 | python3 -m json.too
 
 ## Phase 3 iOS 客户端最小闭环
 
-SwiftUI + URLSession 自实现 SSE 长连接，端到端跑通"输入 → 流式回复 → 商品卡片 → 详情页"。
+SwiftUI + URLSession 自实现 SSE 长连接，端到端跑通"输入 → 流式回复 → 商品卡片 → 详情页"，并在最小闭环之上完成一轮品牌化重做：**PriceCat**（致敬 Coupert）品牌身份 + New York 衢线 editorial 字体 + 极简 Markdown 表格渲染，告别"AI 模板感"。
 
 <p align="center">
-  <img src="docs/assets/phase3_chat_demo.png" width="320" alt="iOS 模拟器端到端验收截图" />
+  <img src="docs/assets/phase3_pricecat_empty.png" width="260" alt="PriceCat 空状态" />
+  <img src="docs/assets/phase3_pricecat_chat.png" width="260" alt="PriceCat 推荐场景" />
+  <img src="docs/assets/phase3_pricecat_table.png" width="260" alt="PriceCat 对比表格场景" />
 </p>
 
-### (a) 模块分层
+### (a) 视觉系统：PriceCat 品牌化
+
+| 文件 | 实现 |
+| --- | --- |
+| [`client/ShoppingGuide/Resources/Theme.swift`](client/ShoppingGuide/Resources/Theme.swift) | 集中管理品牌色 / 字体 / 圆角 / 阴影 token，禁止视图层硬编码：品牌橙 `#FF6B00` / 浅橙白底 `#FFF8F2` / 价格红 `#FF3D00` / 省钱绿 `#00B86B` / chip 浅橙 `#FFF1E5`；全局走 `.system(design: .serif)` → iOS 系统映射到 **New York**（Apple 自家衬线，质感对标 Claude.ai 用的 Tiempos Text），主动远离常见 AI 应用的 sans-serif "AI slop"；导出 `display / title / body / caption / priceLg / priceMd / brandWordmark / tableHeader / tableCell` 字体 token；圆角 `chip 8 / card 16 / hero 20 / bubble 18 / pill 999`；阴影 `card / lifted` |
+| [`client/ShoppingGuide.xcodeproj/project.pbxproj`](client/ShoppingGuide.xcodeproj/project.pbxproj) | `INFOPLIST_KEY_CFBundleDisplayName = PriceCat`，主屏图标下显示品牌名 |
+
+### (b) 模块分层
 
 | 文件 | 实现 |
 | --- | --- |
@@ -322,39 +335,58 @@ SwiftUI + URLSession 自实现 SSE 长连接，端到端跑通"输入 → 流式
 | [`client/ShoppingGuide/Networking/APIClient.swift`](client/ShoppingGuide/Networking/APIClient.swift) | `buildChatStreamRequest`（POST + `Accept: text/event-stream`）+ `fetchProductDetail` GET 异步；`ProductDetail` Codable 模型 |
 | [`client/ShoppingGuide/Features/Chat/ChatTransport.swift`](client/ShoppingGuide/Features/Chat/ChatTransport.swift) | `ChatTransport` protocol 把 ViewModel 与具体 SSE 实现解耦；`LiveChatTransport` 走真实 APIClient，`FakeChatTransport` 给测试喂事件数组 |
 | [`client/ShoppingGuide/Features/Chat/ChatViewModel.swift`](client/ShoppingGuide/Features/Chat/ChatViewModel.swift) | `@MainActor ObservableObject`：token → 累加 `text`、productCard → 追加 `productCards`、clarify → 写入 `clarify`、error → 挂 `errorNotice`、done → `isStreaming = false`；session_id 多轮复用 |
-| [`client/ShoppingGuide/Features/Chat/ChatView.swift`](client/ShoppingGuide/Features/Chat/ChatView.swift) | 主页：输入栏 + ScrollView + ScrollViewReader 流式自动滚底；DEBUG 编译时检测 `-autoSendDemo "<query>"` launch arg 自动发一条，方便命令行端到端 smoke |
-| [`client/ShoppingGuide/Features/Chat/MessageBubble.swift`](client/ShoppingGuide/Features/Chat/MessageBubble.swift) | 单条气泡：用户右对齐蓝底 / Assistant 左对齐灰底；流式时末尾接 `▍` 光标；clarify 渲染 chip 按钮组 |
-| [`client/ShoppingGuide/Features/Product/ProductCardView.swift`](client/ShoppingGuide/Features/Product/ProductCardView.swift) | 80x80 主图 + 品牌 / 类目 / 标题 / 价格区间 / SKU 数 / reason；整张卡片包 `NavigationLink` push 详情 |
-| [`client/ShoppingGuide/Features/Product/ProductDetailView.swift`](client/ShoppingGuide/Features/Product/ProductDetailView.swift) | 详情页：进入 `task` 调 `GET /api/v1/products/{id}`，渲染主图 + 标题 + 全部 SKU 列表 |
+| [`client/ShoppingGuide/Features/Chat/ChatView.swift`](client/ShoppingGuide/Features/Chat/ChatView.swift) | 主页：自绘品牌头（渐变橙猫脸 + `PriceCat` italic wordmark + "a daily companion for considered buying" 副标）+ 空状态居中猫咪图标 + 4 条 starter chips + 输入栏改 pill 圆角橙色 CTA（focus 时品牌色描边）+ ScrollViewReader 流式自动滚底；DEBUG 编译时 `-autoSendDemo "<query>"` launch arg 自动发一条 smoke；用 `static autoSendDemoFired` flag 守一次性（`@State` 随 view 重建归零，从 ProductDetailView pop 回来会重复触发） |
+| [`client/ShoppingGuide/Features/Chat/MessageBubble.swift`](client/ShoppingGuide/Features/Chat/MessageBubble.swift) | 旧实现给 `Text` 加 `.frame(maxWidth: .infinity)` 把气泡撑成整行宽 → 改 `HStack { Spacer / Bubble }` 让气泡 hug 文字真实尺寸；用户气泡品牌橙底白字、Assistant 白底浅边框；流式光标从字符 `▍` 改成呼吸圆点（不再让气泡尺寸抖动）；**Assistant 消息按 markdown block 拆分**——连续段落塞同一气泡、表格独占消息列全宽（突破气泡 `Spacer(minLength:)` 限宽，避免中文每字一行竖排）；用户气泡用纯 `Text`、Assistant 走 `MarkdownView` 支持表格；展示前 `trimmingCharacters(.whitespacesAndNewlines)` 作为后端 rstrip 的展示层 fallback |
+| [`client/ShoppingGuide/Components/MarkdownParser.swift`](client/ShoppingGuide/Components/MarkdownParser.swift) | 极简块级 Markdown 解析（200 行）：行级扫描状态机切「段落 / GFM 表格」两类 block；严格模式认 `\| --- \| --- \|` 分隔行，宽松模式允许 LLM 忘写分隔行（≥2 行同列管道行即当表格）；防御性 fallback：单行管道仍按段落处理；行内 `**bold**` / `*italic*` 交给系统 `AttributedString(markdown:)`；不支持也不打算支持标题 / 列表 / 代码块（Prompt 已硬约束 LLM 不输出） |
+| [`client/ShoppingGuide/Components/MarkdownView.swift`](client/ShoppingGuide/Components/MarkdownView.swift) | 把 `MarkdownBlock` 渲染成 SwiftUI 视图：段落 = `Text(AttributedString)` 衢线 body；`TableBlockView` = 表头浅橙底 + 品牌色衢线 + hairline 列&行分隔（**禁止"程序员风"完整 grid**）+ 卡片圆角描边；`TableBlockView` 可见性 `internal` 让 `MessageBubble` 直接复用（长表格突破气泡限宽独立放置） |
+| [`client/ShoppingGuide/Features/Product/ProductCardView.swift`](client/ShoppingGuide/Features/Product/ProductCardView.swift) | Coupert 风布局：左 110×110 主图 + 右上角"省 ¥xx"绿色 saved badge（`max-min` 差）+ 现价大红字 / 原价划线灰 + reason 浅橙 chip + SKU 数小角标；整张卡片包 `NavigationLink` push 详情 |
+| [`client/ShoppingGuide/Features/Product/ProductDetailView.swift`](client/ShoppingGuide/Features/Product/ProductDetailView.swift) | hero 图 4:3 + 大字衢线标题 + 起价 28pt 重字 + SKU 列表统一白底卡片；进入 `task` 调 `GET /api/v1/products/{id}` |
 
-### (b) 测试覆盖
+### (c) 服务端配套修复：ProductCardExtractor 根治尾部空白泄漏
+
+LLM 正文通常以 `\n\n` 收尾再接 ```` ```product_cards ```` 围栏，旧版 [`server/app/agent/card_extractor.py`](server/app/agent/card_extractor.py) 在 NORMAL 状态下没找到 fence 就把尾部空白立即 emit，导致 iOS 气泡末尾出现 2 行空白（撑高一块灰格子）：
+
+- NORMAL 状态尾部连续空白与可能的 fence 前缀一起 hold，等下一个非空 token 或真 fence 来再决定；
+- fence open 命中时 `buffer[:open_idx].rstrip()` 再 emit；
+- `finalize` 残留 buffer 也 `rstrip()` 丢掉文末空白。
+
+新增 4 条 TDD 用例覆盖：fence 前 `\n\n` / 段内换行保留 / 纯文本 finalize trim / 流式 token 切割。客户端 `MessageBubble` 的 `trim` 保留作为展示层 fallback——后端协议干净，客户端再加一层防御。
+
+### (d) 测试覆盖
 
 [`client/Package.swift`](client/Package.swift) 是独立 SwiftPM 包，与 Xcode 工程**共用** `ShoppingGuide/` 下源文件（不复制不分叉），用 `swift test` 在 macOS 上跑客户端逻辑层单测。
 
 ```
 client/Tests/ShoppingGuideKitTests/
-├── SSEParserTests.swift     12 用例（token/session/status/product_card/clarify/error/done、CRLF 帧、心跳注释、坏 JSON、未知事件、event/data 任意顺序）
-└── ChatViewModelTests.swift  6 用例（happy path 累加 token + 卡片、clarify、error 不中断、空输入忽略、status 不污染正文、session_id 跨轮保留）
+├── SSEParserTests.swift         12 用例（token/session/status/product_card/clarify/error/done、CRLF 帧、心跳注释、坏 JSON、未知事件、event/data 任意顺序）
+├── ChatViewModelTests.swift      6 用例（happy path 累加 token + 卡片、clarify、error 不中断、空输入忽略、status 不污染正文、session_id 跨轮保留）
+└── MarkdownParserTests.swift    11 用例（单段 / 空行多段 / GFM 表 / 段+表+总结 / 对齐符号 / 缺分隔行宽松匹配 / 单 \n 段表混排 / 单管道行不误判 / 流式半行不崩 / 行内 bold+italic / 空输入）
 ```
 
-合计 **18 用例全部绿**，命令行直接跑：
+客户端合计 **29 用例全部绿**；后端 [`server/tests/test_card_extractor.py`](server/tests/test_card_extractor.py) 同步增至 13 用例，全套服务端 59 用例全过。命令行：
 
 ```bash
 cd client
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
 ```
 
-### (c) Phase 3 验收实测（iPhone 17 模拟器）
+### (e) Phase 3 验收实测（iPhone 17 模拟器）
 
-后端起来后跑 `xcrun simctl launch <udid> com.yute.ShoppingGuide -autoSendDemo "推荐一款适合油皮的洗面奶"`，UI 实际表现：
+**场景 1 · 推荐**：`-autoSendDemo "推荐一款适合油皮的洗面奶"`
 
-1. 用户气泡：`推荐一款适合油皮的洗面奶`
-2. Assistant 气泡逐字流出：「给你推荐珊珂的这款洁面乳。泡沫绵密清洁力足，洗完清爽不紧绷，适配油皮清洁需求，性价比很高。」
-3. 文字下方插入卡片：`p_beauty_011`（珊珂洗颜专科绵润泡沫洁面乳 120g），价格 ¥52.00 - ¥69.00，2 种规格，reason"泡沫绵密洗后不紧绷，适配油皮清洁"
-4. 主图通过 `/static/1_美妆护肤/images/p_beauty_011_live.jpg` 异步加载到位
-5. 点击卡片可 push 进 ProductDetailView 查看完整 SKU
+1. 用户气泡：`推荐一款适合油皮的洗面奶`（品牌橙底）
+2. Assistant 气泡逐字流出，衢线 New York 字体，末尾呼吸圆点
+3. 文字下方插入 PriceCat 风卡片：`p_beauty_011`（珊珂洗颜专科绵润泡沫洁面乳 120g），左 110×110 主图 + 右上"省 ¥17"绿 badge + 现价 ¥52 大红字 + reason 浅橙 chip
+4. 主图通过 `/static/1_美妆护肤/images/p_beauty_011_live.jpg` 异步加载
+5. 点击卡片 push `ProductDetailView`，hero 图 + 全部 SKU 白底卡片列表
 
-`p_beauty_011` 真实存在于 MySQL；卡片的标题 / 品牌 / 价格 / 图片 URL 全部由 [`app/db/product_repo.py`](server/app/db/product_repo.py) 从 MySQL hydrate，LLM 不参与生成——满足课题"严禁幻觉"硬约束。
+**场景 2 · 对比**：`-autoSendDemo "对比一下兰蔻小黑瓶和雅诗兰黛小棕瓶"`
+
+1. Assistant 引导段：「我整理了两款精华的对比：」
+2. **下方独占消息列全宽的 Markdown 表格**：表头浅橙底品牌色衢线，4 列「商品ID / 价格区间 / 保湿核心表现 / 适用肤质」hairline 分隔，全程横向布局不再竖排
+3. 表格后跟总结段 + 2 张商品卡片
+
+`p_beauty_011` 等所有 product_id 均真实存在于 MySQL；卡片的标题 / 品牌 / 价格 / 图片 URL 全部由 [`app/db/product_repo.py`](server/app/db/product_repo.py) 从 MySQL hydrate，LLM 仅生成 `reason` 与对比表格的文案描述——满足课题"严禁幻觉"硬约束。
 
 ### Phase 3 复跑指令
 
@@ -383,6 +415,93 @@ DEVELOPER_DIR=$DEV xcrun simctl launch "$UDID" com.yute.ShoppingGuide \
   -autoSendDemo "推荐一款适合油皮的洗面奶"
 DEVELOPER_DIR=$DEV xcrun simctl io "$UDID" screenshot /tmp/phase3.png
 open /tmp/phase3.png
+```
+
+---
+
+## Phase 4-1 Query Rewriter + 反选与排除
+
+把"用户自然语言查询"拆成「干净的语义 query + 结构化 filter 表达式」喂回向量召回链路，根治 Phase 1 评测报告里点名的 `brand_exclude Top-1=0%` 漏洞。
+
+### (a) 模块分层
+
+| 文件 | 实现 |
+| --- | --- |
+| [`server/app/agent/query_rewriter.py`](server/app/agent/query_rewriter.py) | `QueryRewriter` 双路径：**规则正则优先**（`X 元以下` / `预算 X` / `不要 X 品牌` / `非 X` / `100-200 元` 等 pattern，靠 `_RE_PRICE_MAX` / `_RE_PRICE_MIN` / `_RE_PRICE_RANGE` / `_RE_BRAND_EXCLUDE` 4 条 regex 配合 brand 白名单匹配兜底）+ **LLM JSON 兜底**（命中"国产 / 日系 / 韩系 / 欧美 / 国货 / 进口"等需要语义推断的地域词才调一次 Doubao 抽取，否则不调省首 token 延迟）；输出 `ParsedQuery(search_query, price_min/max, categories, brands_include/exclude)`，`to_filter_expr()` 拼成 Milvus `min_sku_price <= X and brand not in [...]` 表达式 |
+| [`server/app/agent/query_rewriter.py`](server/app/agent/query_rewriter.py)（`_split_brand_aliases`） | 库内品牌「Apple 苹果」复合写法 → 拆 alias `{Apple, 苹果}` 全部映射回 canonical，让用户写单边都能命中；`_match_brand` 前缀逐字回退（"耐克的跑鞋" → "耐克的跑" → "耐克 ✓"）容忍 regex 贪婪匹配 |
+| [`server/app/llm/doubao_client.py`](server/app/llm/doubao_client.py) | 新增 `chat_json(messages)` 非流式接口；当前 Doubao 模型还不支持 `response_format=json_object` 强模式（直接 400），改走「Prompt 硬约束 + 容错解析」：`_extract_json_object` 依次尝试 `json.loads` → 去 ```` ```json ``` ```` 围栏 → 花括号配对扫描定位第一个完整 JSON object，三种失败才抛 `ValueError` 走规则兜底 |
+| [`server/app/rag/retriever.py`](server/app/rag/retriever.py) | `RagRetriever.search(query, filter_expr=...)` 把 expr 透传给 Milvus `client.search(filter=...)`，FLAT + IP metric 下 scalar 过滤在 1k 数据规模上 latency 几乎免费 |
+| [`server/app/agent/orchestrator.py`](server/app/agent/orchestrator.py) | retrieve 前调 `query_rewriter.parse()` → 用 rewritten `search_query` 做 embedding、把 `filter_expr` 传给 retriever；**filter 过严吃光命中时去掉 filter 兜底再来一次**（与 eval_recall 一致策略，避免"啥也搜不到"的死路）；`query_rewriter=None` 时退化成 identity rewriter，Phase 2 旧测试 0 改动通过 |
+| [`server/app/db/product_repo.py`](server/app/db/product_repo.py) | `list_brands()` 拉品牌全集，启动时灌进 rewriter 做 LLM 白名单（LLM 编造的"FakeBrandX" 在 `_merge` 阶段被丢弃，5 层防幻觉再多一层） |
+| [`server/app/main.py`](server/app/main.py) | lifespan 启动时一次性 `await repo.list_brands()` → `rewriter.set_known_brands()`，加载失败也不挡服务起来（rewriter 自动回退到无 brand 白名单的规则裸跑） |
+
+### (b) 库内类目 / 品牌实际值踩坑
+
+类目字段在 MySQL 实际是 `美妆护肤 / 数码电子 / 服饰运动 / 食品饮料`（不是数据集目录名"服饰穿戴"），品牌字段对 Apple 用 `Apple 苹果` 复合写法。eval 第一次跑出 `category in ["服饰穿戴"]` 命中 0 条揭露了这个偏差。`KNOWN_CATEGORIES` 与 `_CATEGORY_ALIASES` 已对齐 MySQL 真实值，品牌 alias 拆分支持 `Apple 苹果` 单写命中。
+
+### (c) 测试覆盖
+
+```
+server/tests/
+├── test_query_rewriter.py     20 用例
+│   ├── to_filter_expr × 5     （空 / 价格 / 范围 / 类目+排除 / 双引号转义）
+│   ├── 规则路径 × 8           （X 元以下/预算 X/范围/不要 X/非 X/类目别名/白名单外不误匹配/剥词不丢语义）
+│   ├── LLM 兜底 × 4           （地域词触发 / 普通 query 不触发 / LLM 异常回退 / 编造品牌被丢弃）
+│   ├── 复合品牌名 × 1         （Apple 苹果 单写 Apple 或 苹果 都命中）
+│   ├── 空输入 × 1
+│   └── 剥词保留语义 × 1
+└── 全套 79 用例（原 59 + 新 20）全过
+```
+
+### (d) Phase 4-1 评测实测（25 条黄金集，对照 Phase 1 baseline）
+
+| 意图 | n | Phase 1 Top-1 | **Phase 4 Top-1** | Top-5 |
+| --- | --- | --- | --- | --- |
+| **总体** | 25 | 80.00% | **92.00% (+12pp)** | 100% |
+| brand_exclude | 4 | **0%** | **75% (+75pp)** | 100% |
+| price_filter | 5 | 100% | 100% | 100% |
+| category_recommend | 8 | 87.5% | 87.5% | 100% |
+| scenario | 8 | 100% | 100% | 100% |
+
+完整明细见 [`docs/phase4_eval_report.md`](docs/phase4_eval_report.md)。q16 "国产旗舰手机推荐" Top-1 命中 vivo（语义正确但不在原 gold——gold 只标了华为/小米/OPPO 三款，属 gold 标注限制；Top-5 已命中 gold）。
+
+### (e) 端到端示例（rewriter → filter → milvus）
+
+```python
+>>> parsed = await rewriter.parse("不是耐克的专业跑鞋")
+>>> parsed.search_query
+'的专业跑鞋'
+>>> parsed.brands_exclude
+['耐克']
+>>> parsed.to_filter_expr()
+'category in ["服饰运动"] and brand not in ["耐克"]'
+
+# LLM 兜底场景
+>>> parsed = await rewriter.parse("国产旗舰手机推荐")
+>>> parsed.brands_exclude  # LLM 自动列出 25 个非国产品牌
+['AHC', 'Apple 苹果', 'HOKA', 'Nike', 'Osprey', 'SK-II',
+ 'The North Face', 'The Ordinary', '优衣库', '可口可乐', ...]
+>>> parsed.to_filter_expr()
+'category in ["数码电子"] and brand not in ["AHC", "Apple 苹果", "HOKA", "Nike", ...]'
+```
+
+### Phase 4-1 复跑指令
+
+```bash
+cd server
+source .venv/bin/activate
+
+# 1. 单测（19 条 rewriter + 6 条 orchestrator + 全套 79 条）
+python -m pytest tests/ --ignore=tests/test_smoke.py
+
+# 2. baseline 评测（Phase 1 行为，不带 rewriter）
+python -m scripts.eval_recall
+
+# 3. rewriter 规则版（离线可复现，不调 LLM）
+python -m scripts.eval_recall --with-rewriter rules
+
+# 4. rewriter LLM 版（需 ARK_API_KEY；q16 走 LLM 抽取）
+python -m scripts.eval_recall --with-rewriter llm --output ../docs/phase4_eval_report.md
 ```
 
 ---
