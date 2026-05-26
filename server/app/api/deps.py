@@ -11,6 +11,7 @@ from functools import lru_cache
 from app.agent.clarify_detector import ClarifyDetector, build_clarify_detector
 from app.agent.compare_planner import CompareTargetExtractor, build_compare_extractor
 from app.agent.memory import ConversationMemory, get_memory
+from app.agent.memory_summarizer import MemorySummarizer, build_memory_summarizer
 from app.agent.orchestrator import AgentOrchestrator
 from app.agent.query_rewriter import QueryRewriter, build_query_rewriter
 from app.db.product_repo import ProductRepository, get_product_repository
@@ -44,6 +45,11 @@ def get_clarify_detector() -> ClarifyDetector:
     return build_clarify_detector()
 
 
+@lru_cache(maxsize=1)
+def get_memory_summarizer() -> MemorySummarizer:
+    return build_memory_summarizer(llm=get_llm_client())
+
+
 def get_conversation_memory() -> ConversationMemory:
     return get_memory()
 
@@ -57,6 +63,7 @@ def get_orchestrator() -> AgentOrchestrator:
         query_rewriter=get_query_rewriter(),
         compare_extractor=get_compare_extractor(),
         clarify_detector=get_clarify_detector(),
+        memory_summarizer=get_memory_summarizer(),
     )
 
 

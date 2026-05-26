@@ -186,6 +186,88 @@ async def test_llm_brand_outside_whitelist_dropped():
     assert "FakeBrandX" not in pq.brands_exclude
 
 
+@pytest.mark.parametrize(
+    "msg,expected_min,expected_max",
+    [
+        ("一千元以上的", 1000.0, None),
+        ("两千元以上", 2000.0, None),
+        ("一万元以下", None, 10000.0),
+        ("五百元以下的", None, 500.0),
+        ("预算一千", None, 1000.0),
+        ("一百到两百元", 100.0, 200.0),
+        ("三千到五千元", 3000.0, 5000.0),
+        ("一千五百元以上", 1500.0, None),
+        ("两万元以下", None, 20000.0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_chinese_number_price_filters(msg, expected_min, expected_max):
+    """规则路径需要识别中文数字价格，否则用户问「一千元以上的」会全打到原文兜底。"""
+    rw = build_query_rewriter()
+    pq = await rw.parse(msg)
+    assert pq.price_min == expected_min, f"{msg} expected price_min={expected_min} got {pq.price_min}"
+    assert pq.price_max == expected_max, f"{msg} expected price_max={expected_max} got {pq.price_max}"
+
+
+@pytest.mark.asyncio
+async def test_chinese_numbers_do_not_misfire_on_filler_words():
+    """中文数字 regex 不能把"一款""两只"误判成价格。"""
+    rw = build_query_rewriter()
+    pq = await rw.parse("推荐一款适合油皮的洗面奶")
+    assert pq.price_min is None
+    assert pq.price_max is None
+    pq2 = await rw.parse("来一双跑鞋")
+    assert pq2.price_min is None and pq2.price_max is None
+
+
+@pytest.mark.asyncio
+async def test_history_completes_followup_with_only_price():
+    """Phase 4 多轮指代消解：「1000 元以上的」单独看缺品类，靠 history 补'跑鞋'。"""
+    rw = build_query_rewriter()
+    history = [
+        {"role": "user", "content": "推荐适合慢跑的跑鞋"},
+        {"role": "assistant", "content": "为你推荐..."},
+    ]
+    pq = await rw.parse("1000 元以上的", history=history)
+    assert pq.price_min == 1000
+    # search_query 必须含主体词"跑鞋"，否则向量召回会打偏
+    assert "跑鞋" in pq.search_query
+
+
+@pytest.mark.asyncio
+async def test_history_completes_followup_with_only_brand():
+    """「不要日系」单独看缺品类。"""
+    rw = build_query_rewriter(known_brands=["资生堂", "SK-II", "兰蔻"])
+    history = [
+        {"role": "user", "content": "推荐保湿精华"},
+        {"role": "assistant", "content": "..."},
+    ]
+    pq = await rw.parse("不要资生堂", history=history)
+    assert "资生堂" in pq.brands_exclude
+    assert "精华" in pq.search_query
+
+
+@pytest.mark.asyncio
+async def test_history_not_used_when_self_contained():
+    """完整句子不要被 history 干扰污染。"""
+    rw = build_query_rewriter()
+    history = [{"role": "user", "content": "我之前问了笔记本"}]
+    pq = await rw.parse("推荐一款适合油皮的洗面奶", history=history)
+    # search_query 应保持原意，不应被 "笔记本" 污染
+    assert "洗面奶" in pq.search_query
+    assert "笔记本" not in pq.search_query
+
+
+@pytest.mark.asyncio
+async def test_history_ignored_when_history_empty():
+    """history 为空或 None 时按原行为返回。"""
+    rw = build_query_rewriter()
+    pq = await rw.parse("1000 元以上的", history=None)
+    assert pq.price_min == 1000
+    # 没有 history 兜底，search_query 退回原文
+    assert pq.search_query  # 不崩，至少有 search_query
+
+
 @pytest.mark.asyncio
 async def test_empty_input_returns_empty_parse():
     rw = build_query_rewriter()

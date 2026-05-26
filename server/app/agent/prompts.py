@@ -78,14 +78,31 @@ def _history_messages(history: list[dict] | None) -> list[dict]:
     return cleaned
 
 
+def _format_summary_block(summary: str | None) -> str:
+    """Phase 4-4：把 memory summarizer 给的偏好概述拼成 system 块。"""
+    if not summary or not summary.strip():
+        return ""
+    return (
+        "<conversation_summary>\n"
+        f"用户偏好概述（来自此前多轮对话）：{summary.strip()}\n"
+        "回答时请参考但不要复述，回到当前用户最新一句。\n"
+        "</conversation_summary>"
+    )
+
+
 def build_recommend_messages(
     *,
     user_message: str,
     retrieved: Iterable[RetrievedProduct],
     history: list[dict] | None,
+    summary: str | None = None,
 ) -> list[dict]:
     """商品推荐 prompt。retrieved 为空时切换到「无匹配」话术。"""
-    system_parts = [_BASE_RULES, "", _format_retrieved_block(retrieved)]
+    system_parts = [_BASE_RULES]
+    summary_block = _format_summary_block(summary)
+    if summary_block:
+        system_parts.extend(["", summary_block])
+    system_parts.extend(["", _format_retrieved_block(retrieved)])
     msgs: list[dict] = [{"role": "system", "content": "\n".join(system_parts)}]
     msgs.extend(_history_messages(history))
     msgs.append({"role": "user", "content": user_message})
@@ -97,6 +114,7 @@ def build_compare_messages(
     user_message: str,
     retrieved: Iterable[RetrievedProduct],
     history: list[dict] | None,
+    summary: str | None = None,
 ) -> list[dict]:
     """商品对比 prompt：在 base 规则上追加表格 / 维度结构化要求。
 
@@ -120,7 +138,11 @@ def build_compare_messages(
 4. 数据行 3-4 行；价格区间直接从 retrieved 给出的「价格=￥a - ￥b」原样填；其它维度结合命中片段提炼；
 5. 表格之后**空一行**，再写 ≤ 40 字的总结句（先把更适合的那款 product_id 点出来）；
 6. 最后照例追加 product_cards 围栏，把对比涉及的所有 product_id 都列进去。"""
-    system_parts = [_BASE_RULES + compare_rules, "", _format_retrieved_block(retrieved)]
+    system_parts = [_BASE_RULES + compare_rules]
+    summary_block = _format_summary_block(summary)
+    if summary_block:
+        system_parts.extend(["", summary_block])
+    system_parts.extend(["", _format_retrieved_block(retrieved)])
     msgs: list[dict] = [{"role": "system", "content": "\n".join(system_parts)}]
     msgs.extend(_history_messages(history))
     msgs.append({"role": "user", "content": user_message})

@@ -80,6 +80,38 @@ def test_recommend_messages_handle_empty_retrieval():
     assert "未找到" in sys or "抱歉" in sys
 
 
+def test_recommend_messages_include_summary_block():
+    """Phase 4-4：传入 summary 时应作为 <conversation_summary> 块拼进 system。"""
+    msgs = build_recommend_messages(
+        user_message="再推荐一款",
+        retrieved=[_mk_product("p_a")],
+        history=[],
+        summary="用户偏好油皮 / 预算 100 内，已被推荐 p_beauty_011",
+    )
+    sys = msgs[0]["content"]
+    assert "conversation_summary" in sys
+    assert "油皮" in sys
+    assert "p_beauty_011" in sys
+
+
+def test_recommend_messages_no_summary_block_when_none():
+    msgs = build_recommend_messages(
+        user_message="推荐",
+        retrieved=[_mk_product("p_a")],
+        history=[],
+        summary=None,
+    )
+    assert "conversation_summary" not in msgs[0]["content"]
+    # 空字符串也不应产生空块
+    msgs2 = build_recommend_messages(
+        user_message="推荐",
+        retrieved=[_mk_product("p_a")],
+        history=[],
+        summary="",
+    )
+    assert "conversation_summary" not in msgs2[0]["content"]
+
+
 def test_compare_messages_include_two_products():
     msgs = build_compare_messages(
         user_message="对比 A 和 B",

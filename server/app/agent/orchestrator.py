@@ -21,6 +21,7 @@ from app.agent.clarify_detector import ClarifyDetector
 from app.agent.compare_planner import CompareTargetExtractor
 from app.agent.intent import IntentRouter
 from app.agent.memory import ConversationMemory
+from app.agent.memory_summarizer import MemorySummarizer
 from app.agent.prompts import build_compare_messages, build_recommend_messages
 from app.agent.query_rewriter import ParsedQuery, QueryRewriter
 from app.rag.retriever import RetrievedProduct
@@ -60,6 +61,7 @@ class AgentOrchestrator:
         query_rewriter: QueryRewriter | None = None,
         compare_extractor: CompareTargetExtractor | None = None,
         clarify_detector: ClarifyDetector | None = None,
+        memory_summarizer: MemorySummarizer | None = None,
     ) -> None:
         self.retriever = retriever
         self.llm = llm
@@ -73,10 +75,31 @@ class AgentOrchestrator:
         self.compare_extractor = compare_extractor
         # clarify_detector 缺省时直接跳过主动澄清判定（保 phase 2 行为）。
         self.clarify_detector = clarify_detector
+        # memory_summarizer 缺省时 history 走 FIFO 截断（保 phase 2 行为）。
+        self.memory_summarizer = memory_summarizer
 
     async def orchestrate(self, req: ChatRequest) -> AsyncIterator[dict]:
         session = self.memory.get_or_create(req.session_id)
         yield {"event": "session", "data": {"session_id": session.id}}
+
+        # 0) Phase 4-4：进入新一轮前，看看上一轮 save_turn 后是否需要摘要
+        # 触发条件：history ≥ summary_after_turns 轮。await summarizer 同步阻塞，
+        # 多等 1-2s LLM 调用换取后续多轮上下文不丢失。
+        if self.memory_summarizer is not None and self.memory.needs_summary(session):
+            try:
+                older = self.memory.get_history_to_summarize(session)
+                new_summary = await self.memory_summarizer.summarize(
+                    previous_summary=session.summary,
+                    older_history=older,
+                )
+                if new_summary:
+                    self.memory.apply_summary(session.id, new_summary)
+                    logger.info(
+                        "session %s 历史已摘要，summary=%s（保留最近 %d 轮原文）",
+                        session.id, new_summary[:60], self.memory.keep_recent_turns,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("memory 摘要失败，本轮带完整 history 继续：%s", exc)
 
         # 1) 意图识别
         yield {"event": "status", "data": {"stage": "parsing"}}
@@ -97,7 +120,7 @@ class AgentOrchestrator:
 
         # 2) 检索（Phase 4：先 query_rewriter 抽干净 query + filter，再走向量召回 + metadata filter）
         yield {"event": "status", "data": {"stage": "retrieving"}}
-        parsed = await self._rewrite(intent.search_query)
+        parsed = await self._rewrite(intent.search_query, history=session.history)
         filter_expr = parsed.to_filter_expr()
         if filter_expr:
             logger.info("Milvus filter_expr=%s, search_query=%s", filter_expr, parsed.search_query)
@@ -139,11 +162,13 @@ class AgentOrchestrator:
         yield {"event": "status", "data": {"stage": "generating"}}
         if intent.intent == "compare":
             messages = build_compare_messages(
-                user_message=req.message, retrieved=retrieved, history=session.history,
+                user_message=req.message, retrieved=retrieved,
+                history=session.history, summary=session.summary,
             )
         else:
             messages = build_recommend_messages(
-                user_message=req.message, retrieved=retrieved, history=session.history,
+                user_message=req.message, retrieved=retrieved,
+                history=session.history, summary=session.summary,
             )
 
         allowed_ids = {p.product_id for p in retrieved}
@@ -247,12 +272,17 @@ class AgentOrchestrator:
         # 最多 3 件，保证 prompt 不爆 + LLM 表格不超宽
         return list(merged.values())[:3]
 
-    async def _rewrite(self, search_query: str) -> ParsedQuery:
+    async def _rewrite(
+        self,
+        search_query: str,
+        *,
+        history: list[dict] | None = None,
+    ) -> ParsedQuery:
         """没接 rewriter 就返回 identity ParsedQuery（保 Phase 2 行为）。"""
         if self.query_rewriter is None:
             return ParsedQuery(search_query=search_query)
         try:
-            return await self.query_rewriter.parse(search_query)
+            return await self.query_rewriter.parse(search_query, history=history)
         except Exception as exc:  # noqa: BLE001
             logger.warning("QueryRewriter.parse 异常，走原文检索：%s", exc)
             return ParsedQuery(search_query=search_query)

@@ -193,6 +193,79 @@ async def test_llm_failure_falls_back_to_top_products():
         assert pid in {"p_a", "p_b", "p_c"}
 
 
+class _FakeSummarizer:
+    """fake memory_summarizer：记录调用，返回固定 summary。"""
+    def __init__(self, summary: str = "[摘要] 用户油皮预算 100 内"):
+        self._summary = summary
+        self.calls = 0
+        self.last_older = None
+
+    async def summarize(self, *, previous_summary, older_history):
+        self.calls += 1
+        self.last_older = list(older_history)
+        return self._summary
+
+
+@pytest.mark.asyncio
+async def test_memory_summarize_triggered_on_long_history():
+    """Phase 4-4：超过 summary_after_turns 时入口 await summarizer，history 被压缩。"""
+    from app.agent.memory import ConversationMemory
+
+    # 阈值降到 2 轮（4 条 message）方便构造
+    mem = ConversationMemory(summary_after_turns=2, keep_recent_turns=1)
+    sid = mem.get_or_create(None).id
+    # 预先塞满 history（3 轮）让 needs_summary=True
+    for i in range(3):
+        mem.save_turn(sid, f"u{i}", f"a{i}", [])
+
+    retr = _FakeRetriever([_product("p_a")])
+    summarizer = _FakeSummarizer()
+    orch = AgentOrchestrator(
+        retriever=retr,
+        llm=_FakeLLM(["回复"]),
+        product_repo=_FakeProductRepo(),
+        memory=mem,
+        memory_summarizer=summarizer,
+    )
+
+    events = [
+        e async for e in orch.orchestrate(
+            ChatRequest(session_id=sid, message="推荐一款适合油皮的洗面奶")
+        )
+    ]
+    # summarizer 应被调用恰好 1 次（本轮入口）
+    assert summarizer.calls == 1
+    # 摘要后 session 应带上 summary
+    s = mem.get_or_create(sid)
+    assert s.summary
+    assert "油皮" in s.summary
+    # history 应被截断到 keep_recent_turns=1 轮 + 本轮新增 = 4 条
+    assert len(s.history) == 4
+    # 验证流程正常跑完
+    assert events[-1]["event"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_memory_summarize_skipped_when_under_threshold():
+    """history 没到阈值时不应调 summarizer。"""
+    from app.agent.memory import ConversationMemory
+
+    mem = ConversationMemory(summary_after_turns=6, keep_recent_turns=3)
+    sid = mem.get_or_create(None).id
+    mem.save_turn(sid, "u1", "a1", [])  # 只 1 轮
+
+    summarizer = _FakeSummarizer()
+    orch = AgentOrchestrator(
+        retriever=_FakeRetriever([_product("p_a")]),
+        llm=_FakeLLM(["回复"]),
+        product_repo=_FakeProductRepo(),
+        memory=mem,
+        memory_summarizer=summarizer,
+    )
+    [_ async for _ in orch.orchestrate(ChatRequest(session_id=sid, message="再推荐"))]
+    assert summarizer.calls == 0
+
+
 @pytest.mark.asyncio
 async def test_recommend_with_clarify_detector_short_circuits_chips():
     """Phase 4-3：「推荐一款手机」走 recommend 意图但信息不足，应短路 emit clarify。"""

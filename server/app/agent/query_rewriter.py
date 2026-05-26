@@ -119,22 +119,85 @@ class _LLMJSON(Protocol):
 
 # ---- 规则正则 ----
 
-# "200元以下" / "200 块以内" / "≤200" / "200 以下"
+# 数字 token：阿拉伯数字（含小数）或中文数字 chunk。
+# 中文数字必须含至少一个单位字 [十百千万]，避免把"一款""两只"误判成数字。
+_NUM_AR = r"[0-9]+(?:\.[0-9]+)?"
+_NUM_CN = r"[一二三四五六七八九两零]*[十百千万亿][一二三四五六七八九十百千万亿两零]*"
+_NUM = rf"(?:{_NUM_AR}|{_NUM_CN})"
+
+# "200元以下" / "一千元以下" / "≤200" / "预算 500"
 _RE_PRICE_MAX = re.compile(
-    r"(?:≤|<=|不超过|低于|预算|不到|最多|最高)\s*([0-9]+(?:\.[0-9]+)?)|"
-    r"([0-9]+(?:\.[0-9]+)?)\s*(?:元|块|￥|¥|RMB)?\s*(?:以下|以内|之内|内|以下的|以内的)",
+    rf"(?:≤|<=|不超过|低于|预算|不到|最多|最高)\s*({_NUM})|"
+    rf"({_NUM})\s*(?:元|块|￥|¥|RMB)?\s*(?:以下|以内|之内|内|以下的|以内的)",
     re.IGNORECASE,
 )
-# "100元以上" / "≥100" / "至少 100"
+# "100元以上" / "一千元以上" / "≥100"
 _RE_PRICE_MIN = re.compile(
-    r"(?:≥|>=|不少于|至少|高于|起步)\s*([0-9]+(?:\.[0-9]+)?)|"
-    r"([0-9]+(?:\.[0-9]+)?)\s*(?:元|块|￥|¥|RMB)?\s*(?:以上|起步|起)",
+    rf"(?:≥|>=|不少于|至少|高于|起步)\s*({_NUM})|"
+    rf"({_NUM})\s*(?:元|块|￥|¥|RMB)?\s*(?:以上|起步|起)",
     re.IGNORECASE,
 )
-# "100-200" / "100~200" / "100到200"
+# "100-200" / "100~200" / "一百到两百"
 _RE_PRICE_RANGE = re.compile(
-    r"([0-9]+(?:\.[0-9]+)?)\s*[-~到至]\s*([0-9]+(?:\.[0-9]+)?)\s*(?:元|块|￥|¥|RMB)?"
+    rf"({_NUM})\s*[-~到至]\s*({_NUM})\s*(?:元|块|￥|¥|RMB)?"
 )
+
+
+# 中文数字 → 阿拉伯整数。覆盖 0–亿 量级，电商价格场景够用；解析失败返回 None
+# 让 _to_float 兜底（绝不抛异常打挂主路径）。
+_CN_DIGIT: dict[str, int] = {
+    "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+    "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+}
+_CN_UNIT: dict[str, int] = {"十": 10, "百": 100, "千": 1000, "万": 10000, "亿": 100_000_000}
+
+
+def _parse_cn_number(s: str) -> Optional[int]:
+    """简易中文数字解析：「一千五百」→ 1500，「两万」→ 20000。
+
+    扫描一遍：累加 digit * 当前 unit。万 / 亿做一次 carry（把累计 total 乘上去）。
+    任何非法字符直接返回 None，让外层走原文兜底。
+    """
+    if not s:
+        return None
+    section = 0    # 当前万/亿 section 内累计
+    current = 0    # 暂存数字（等下一个 unit 来乘）
+    total = 0      # 已结算的 section 累计
+    for ch in s:
+        if ch in _CN_DIGIT:
+            current = _CN_DIGIT[ch]
+        elif ch in _CN_UNIT:
+            unit = _CN_UNIT[ch]
+            if unit >= 10_000:
+                # 万 / 亿 → 把当前 section 一次性 carry 上去
+                section = (section + current) * unit
+                total += section
+                section = 0
+                current = 0
+            else:
+                # 十 / 百 / 千 → 加到 section
+                if current == 0:
+                    current = 1   # "十" 视作 "一十"
+                section += current * unit
+                current = 0
+        else:
+            return None
+    section += current
+    total += section
+    return total or None
+
+
+def _to_float(num_str: str) -> Optional[float]:
+    """把 regex 抓到的 num_str（阿拉伯 / 中文混合）转 float。失败返回 None。"""
+    if not num_str:
+        return None
+    s = num_str.strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    v = _parse_cn_number(s)
+    return float(v) if v is not None else None
 # 否定品牌："不要 XXX" / "不是 XXX" / "排除 XXX" / "除了 XXX" / "非 XXX"
 _RE_BRAND_EXCLUDE = re.compile(
     r"(?:不要|不是|排除|除了|非|不含)\s*([A-Za-z一-龥\-]{1,16})"
@@ -192,13 +255,30 @@ class QueryRewriter:
                 # 已被其他品牌占用的 alias 不覆盖，避免歧义
                 self._alias_to_canonical.setdefault(tl, canon)
 
-    async def parse(self, message: str) -> ParsedQuery:
-        """规则跑一遍 → 不够再调 LLM 补缺；最终合并返回。"""
+    async def parse(
+        self,
+        message: str,
+        *,
+        history: list[dict] | None = None,
+    ) -> ParsedQuery:
+        """规则跑一遍 → 不够再调 LLM 补缺；最终合并返回。
+
+        ``history`` 用于多轮指代消解：当用户写"1000 元以上的"这种承接上文的
+        补充约束时，单看本句缺少品类语义，会让向量召回打偏。规则路径下若
+        发现剥词后 search_query 极短，从 history 最近 user message 拼上主体
+        名词；LLM 路径下也会带着 history 让 LLM 输出 self-contained query。
+        """
         text = (message or "").strip()
         if not text:
             return ParsedQuery(search_query="")
 
         rule = self._parse_rules(text)
+
+        # Phase 4 多轮指代消解：本句剥词后 search_query 太短且抓到了
+        # 价格/品牌 filter，认为这是承接上文，从 history 补主体名词回去
+        if history and _needs_context_completion(rule, original=text):
+            rule.search_query = _merge_history_context(rule.search_query, history)
+            logger.info("history 上下文补全后 search_query=%s", rule.search_query)
 
         # 规则已能定下价格 + 品牌排除，且没有"日系/国产/韩系/欧美"这类需要语义推断的词
         # 时不再调 LLM，省一次往返。
@@ -225,19 +305,22 @@ class QueryRewriter:
 
         # 范围优先匹配
         if m := _RE_PRICE_RANGE.search(text):
-            a, b = float(m.group(1)), float(m.group(2))
-            price_min, price_max = min(a, b), max(a, b)
-            cleaned = cleaned.replace(m.group(0), " ")
+            a, b = _to_float(m.group(1)), _to_float(m.group(2))
+            if a is not None and b is not None:
+                price_min, price_max = min(a, b), max(a, b)
+                cleaned = cleaned.replace(m.group(0), " ")
         else:
             if m := _RE_PRICE_MAX.search(text):
                 num_str = m.group(1) or m.group(2)
-                if num_str:
-                    price_max = float(num_str)
+                parsed_max = _to_float(num_str)
+                if parsed_max is not None:
+                    price_max = parsed_max
                     cleaned = cleaned.replace(m.group(0), " ")
             if m := _RE_PRICE_MIN.search(cleaned):
                 num_str = m.group(1) or m.group(2)
-                if num_str:
-                    price_min = float(num_str)
+                parsed_min = _to_float(num_str)
+                if parsed_min is not None:
+                    price_min = parsed_min
                     cleaned = cleaned.replace(m.group(0), " ")
 
         # 品牌排除：仅在「已知品牌列表」里查实，避免误把"不要含酒精"当成品牌"含酒精"。
@@ -391,6 +474,48 @@ def _merge(
     out.brands_include = [b for b in out.brands_include if b not in out.brands_exclude]
 
     return out
+
+
+def _needs_context_completion(parsed: ParsedQuery, *, original: str) -> bool:
+    """判定 search_query 是不是「承接上文的补充约束」需要 history 补全。
+
+    触发条件（任一）：
+    - 原句很短（< 8 中文字符）且抓到了 price / brand 任意 filter，多半是
+      "1000 元以上的" / "再便宜一点" / "不要日系" 这种增量约束；
+    - 剥词后 search_query 几乎为空（≤ 2 字符）也补一下，省得 embedding 打偏。
+    """
+    sq = parsed.search_query.strip()
+    has_filter = bool(
+        parsed.price_min is not None
+        or parsed.price_max is not None
+        or parsed.brands_include
+        or parsed.brands_exclude
+    )
+    if has_filter and len(original) < 8:
+        return True
+    if len(sq) <= 2:
+        return True
+    return False
+
+
+def _merge_history_context(search_query: str, history: list[dict]) -> str:
+    """从 history 最近 2 条 user message 抽主体词拼到 search_query 前。
+
+    粗糙但有效：直接把最近 user 文本与 search_query 拼接，embedding 模型
+    自己消化语义，不再尝试在客户端做 NLP 分词。控制总长 ≤ 80 字符避免污染。
+    """
+    user_msgs = [
+        m.get("content", "").strip()
+        for m in history
+        if m.get("role") == "user" and m.get("content")
+    ]
+    if not user_msgs:
+        return search_query
+    context = " ".join(user_msgs[-2:])
+    merged = f"{context} {search_query}".strip()
+    if len(merged) > 80:
+        merged = merged[-80:]
+    return merged
 
 
 def _canon_brand(name: Any, whitelist: dict[str, str]) -> Optional[str]:

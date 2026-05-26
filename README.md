@@ -66,11 +66,11 @@ cd ./client
 - [x] **Phase 1**：数据工程与向量索引 ([详情](#phase-1-数据工程与向量索引)，[评测报告](docs/phase1_eval_report.md))
 - [x] **Phase 2**：后端最小闭环 ([详情](#phase-2-后端最小闭环))
 - [x] **Phase 3**：iOS 客户端最小闭环 ([详情](#phase-3-ios-客户端最小闭环))
-- [ ] **Phase 4**：对话能力增强（多轮 / 反选 / 对比） — 进行中
+- [x] **Phase 4**：对话能力增强（多轮 / 反选 / 对比）
   - [x] 子项 1：Query Rewriter + 结构化筛选 + 反选与排除 ([详情](#phase-4-1-query-rewriter--反选与排除)，[评测报告](docs/phase4_eval_report.md))
   - [x] 子项 2：多商品对比（CompareTargetExtractor + 并行检索 + GFM 表格 Prompt）([详情](#phase-4-2-多商品对比))
   - [x] 子项 3：主动澄清（ClarifyDetector + 13 类目 chips 模板）([详情](#phase-4-3-主动澄清))
-  - [ ] 子项 4：多轮 memory 摘要压缩
+  - [x] 子项 4：多轮 memory 摘要压缩（MemorySummarizer + summary 注入 prompt）([详情](#phase-4-4-多轮-memory-摘要压缩))
 - [ ] Phase 5：加分项（业务闭环 / 多模态 / 性能）
 - [ ] Phase 6：打磨与交付
 
@@ -427,13 +427,33 @@ open /tmp/phase3.png
 
 | 文件 | 实现 |
 | --- | --- |
-| [`server/app/agent/query_rewriter.py`](server/app/agent/query_rewriter.py) | `QueryRewriter` 双路径：**规则正则优先**（`X 元以下` / `预算 X` / `不要 X 品牌` / `非 X` / `100-200 元` 等 pattern，靠 `_RE_PRICE_MAX` / `_RE_PRICE_MIN` / `_RE_PRICE_RANGE` / `_RE_BRAND_EXCLUDE` 4 条 regex 配合 brand 白名单匹配兜底）+ **LLM JSON 兜底**（命中"国产 / 日系 / 韩系 / 欧美 / 国货 / 进口"等需要语义推断的地域词才调一次 Doubao 抽取，否则不调省首 token 延迟）；输出 `ParsedQuery(search_query, price_min/max, categories, brands_include/exclude)`，`to_filter_expr()` 拼成 Milvus `min_sku_price <= X and brand not in [...]` 表达式 |
+| [`server/app/agent/query_rewriter.py`](server/app/agent/query_rewriter.py) | `QueryRewriter` 双路径：**规则正则优先**（`X 元以下` / `预算 X` / `不要 X 品牌` / `非 X` / `100-200 元` 等 pattern，靠 `_RE_PRICE_MAX` / `_RE_PRICE_MIN` / `_RE_PRICE_RANGE` / `_RE_BRAND_EXCLUDE` 4 条 regex 配合 brand 白名单匹配兜底；regex 同时认阿拉伯数字与**中文数字 chunk**——"一千元以上 / 两百元以下 / 一万元 / 一千五百元"等都能解析，靠 `_parse_cn_number` 一次扫描转 int，要求 chunk 含 `[十百千万亿]` 单位字才匹配避免"一款 / 两只"误判）+ **LLM JSON 兜底**（命中"国产 / 日系 / 韩系 / 欧美 / 国货 / 进口"等需要语义推断的地域词才调一次 Doubao 抽取，否则不调省首 token 延迟）；输出 `ParsedQuery(search_query, price_min/max, categories, brands_include/exclude)`，`to_filter_expr()` 拼成 Milvus `min_sku_price <= X and brand not in [...]` 表达式 |
 | [`server/app/agent/query_rewriter.py`](server/app/agent/query_rewriter.py)（`_split_brand_aliases`） | 库内品牌「Apple 苹果」复合写法 → 拆 alias `{Apple, 苹果}` 全部映射回 canonical，让用户写单边都能命中；`_match_brand` 前缀逐字回退（"耐克的跑鞋" → "耐克的跑" → "耐克 ✓"）容忍 regex 贪婪匹配 |
 | [`server/app/llm/doubao_client.py`](server/app/llm/doubao_client.py) | 新增 `chat_json(messages)` 非流式接口；当前 Doubao 模型还不支持 `response_format=json_object` 强模式（直接 400），改走「Prompt 硬约束 + 容错解析」：`_extract_json_object` 依次尝试 `json.loads` → 去 ```` ```json ``` ```` 围栏 → 花括号配对扫描定位第一个完整 JSON object，三种失败才抛 `ValueError` 走规则兜底 |
 | [`server/app/rag/retriever.py`](server/app/rag/retriever.py) | `RagRetriever.search(query, filter_expr=...)` 把 expr 透传给 Milvus `client.search(filter=...)`，FLAT + IP metric 下 scalar 过滤在 1k 数据规模上 latency 几乎免费 |
 | [`server/app/agent/orchestrator.py`](server/app/agent/orchestrator.py) | retrieve 前调 `query_rewriter.parse()` → 用 rewritten `search_query` 做 embedding、把 `filter_expr` 传给 retriever；**filter 过严吃光命中时去掉 filter 兜底再来一次**（与 eval_recall 一致策略，避免"啥也搜不到"的死路）；`query_rewriter=None` 时退化成 identity rewriter，Phase 2 旧测试 0 改动通过 |
 | [`server/app/db/product_repo.py`](server/app/db/product_repo.py) | `list_brands()` 拉品牌全集，启动时灌进 rewriter 做 LLM 白名单（LLM 编造的"FakeBrandX" 在 `_merge` 阶段被丢弃，5 层防幻觉再多一层） |
 | [`server/app/main.py`](server/app/main.py) | lifespan 启动时一次性 `await repo.list_brands()` → `rewriter.set_known_brands()`，加载失败也不挡服务起来（rewriter 自动回退到无 brand 白名单的规则裸跑） |
+
+### (b1) 多轮指代消解（修于 Phase 4 收尾）
+
+iOS 端实测发现：第二轮发「1000 元以上的」，单独看缺少品类语义，向量召回直接打偏（query="的" 几乎是空 embedding），LLM 拿到错的 retrieved 直接吐"库内未找到匹配商品"。
+
+**根因**：`QueryRewriter` 与 `Retriever` 不接 `history`，承接上文的补充约束（"再便宜一点 / 不要日系 / 1000 元以上的"）失去主体。
+
+**修法**：`QueryRewriter.parse(message, history=...)` 加 history 参数；规则路径下若发现原句 < 8 字符且抓到 price / brand filter，从 history 最近 2 条 user message 拼上主体词。orchestrator 调用时把 `session.history` 透传进去。
+
+实测两轮场景：
+
+```
+轮 1 「推荐适合慢跑的跑鞋」 → 推 p_clothes_008/007/009（耐克/阿迪/HOKA 跑鞋）
+轮 2 「1000 元以上的」
+     ↓ rewriter.parse(history=[...])
+       search_query 从 "的" 补全为 "推荐适合慢跑的跑鞋 的"
+       price_min=1000 抽出来
+     ↓ retrieve（向量召回锁跑鞋 + filter max_sku_price >= 1000）
+     ↓ p_clothes_008（阿迪 ¥1399）+ p_clothes_009（HOKA ¥1099-1119）
+```
 
 ### (b) 库内类目 / 品牌实际值踩坑
 
@@ -654,6 +674,117 @@ bash scripts/smoke_chat.sh "推荐一款手机"             # 应触发 clarify
 bash scripts/smoke_chat.sh "推荐一款拍照好的手机"     # 不该触发，应正常推卡片
 bash scripts/smoke_chat.sh "想买洗面奶"               # 应触发 clarify
 bash scripts/smoke_chat.sh "推荐一款适合油皮的洗面奶" # 不该触发
+```
+
+---
+
+## Phase 4-4 多轮 memory 摘要压缩
+
+Phase 2 `ConversationMemory` 只做 6 轮 FIFO 截断，超过就直接丢前段——用户在第 1 轮说"我是油皮"，第 8 轮就忘了。docs/01 §Phase 4 明确要求"超过自动摘要压缩"。本子项把摘要压缩落地。
+
+### (a) 模块分层
+
+| 文件 | 实现 |
+| --- | --- |
+| [`server/app/agent/memory.py`](server/app/agent/memory.py) | `Session.summary: str \| None` 新增字段；`ConversationMemory` 构造参数从单一 `max_turns=6` 拆成三档：`max_turns=12`（硬上限兜底）/ `summary_after_turns=6`（触发摘要的阈值）/ `keep_recent_turns=3`（摘要后保留的最近原文轮数）；新增 `needs_summary` / `get_history_to_summarize` / `apply_summary` 三个方法；构造时断言 `keep_recent < summary_after` 防止配置错乱 |
+| [`server/app/agent/memory_summarizer.py`](server/app/agent/memory_summarizer.py)（新） | `MemorySummarizer.summarize(previous_summary, older_history)` 复用 `chat_json` 把老对话稿压成 ≤100 字偏好概述；要点优先级：① 用户明确约束（品类/价格/品牌/场景/肤质）② 已推荐过的 product_id 列表 ③ 反馈倾向（喜欢/不要）；transcript > 4000 字符时尾部截断（保留更近的对话）；LLM 异常 / 缺 summary 字段都不清空已有 summary，返回旧值兜底 |
+| [`server/app/agent/prompts.py`](server/app/agent/prompts.py) | `build_recommend_messages` 与 `build_compare_messages` 新增 `summary: str \| None` 参数，拼成 `<conversation_summary>` 块放进 system message；空 summary 不产生空块（不污染原 system prompt 长度） |
+| [`server/app/agent/orchestrator.py`](server/app/agent/orchestrator.py) | `orchestrate()` 入口判 `memory.needs_summary(session)` → await `summarizer.summarize(...)` → `memory.apply_summary(...)`；触发后 history 截到最近 `keep_recent_turns` 轮 + 本轮新增；build prompt 时把 `session.summary` 传进去；summarizer 异常不挡主路径（带完整 history 继续） |
+| [`server/app/api/deps.py`](server/app/api/deps.py) | `get_memory_summarizer` 单例工厂；orchestrator 装配时注入。缺省 None 时退化为 Phase 2 FIFO 行为 |
+
+### (b) 数据流（典型 8 轮对话）
+
+```
+轮 1-5：save_turn 累积 → history 长度 = 10
+轮 6 进入：
+  needs_summary(history=12) ✗ 还没到阈值
+  save_turn → history = 14
+轮 7 进入：
+  needs_summary(history=14, threshold=12) ✓ 触发
+  ↓
+  older = history[:-6]  # 前 4 轮老对话
+  summarizer.summarize(previous_summary=None, older_history=older)
+    → "用户油皮，预算100内，排除日系，已推荐 p_beauty_011..."
+  ↓
+  apply_summary: session.summary = "...", history = history[-6:]
+  ↓
+  build_recommend_messages(history=..., summary="用户油皮...")
+    → system prompt 内嵌 <conversation_summary> 块
+  ↓
+  LLM 拿到"完整 summary + 最近 3 轮原文"作答
+```
+
+### (c) 测试覆盖
+
+```
+server/tests/
+├── test_memory.py             11 用例（+6 phase 4-4）
+│   ├── 旧 phase 2 行为 × 5    （FIFO / save_turn / last_recommended_ids）
+│   └── 摘要相关 × 6           （needs_summary 阈值判定 / get_history_to_summarize 切割 /
+│                              apply_summary 写字段+截 history / 空 summary 不清空旧值 /
+│                              配置非法时构造抛 AssertionError）
+├── test_memory_summarizer.py   6 用例（全新）
+│   ├── LLM 返回 summary → 字段写入        × 1
+│   ├── 带上 previous_summary 增量摘要      × 1
+│   ├── 空 history 不调 LLM                × 1
+│   ├── LLM 异常回退到 previous_summary    × 1
+│   ├── LLM 返回缺 summary 字段不清空旧值   × 1
+│   └── transcript 超长截尾保留后段        × 1
+├── test_prompts.py             7 用例（+2 phase 4-4）
+│   └── summary 拼 system 块 / summary=None 时不产生空块
+└── test_orchestrator.py       10 用例（+2 phase 4-4）
+    ├── 超阈值入口 await summarizer + history 被截断
+    └── 未到阈值不调 summarizer
+```
+
+服务端测试 120 → **136 全过**（+16）。
+
+### (d) Phase 4-4 端到端实测（8 轮多轮对话）
+
+```bash
+# session_id 复用同一会话跑 8 轮：
+[轮1] 推荐一款适合油皮的洗面奶   → 推 p_beauty_011（珊珂）
+[轮2] 价格再便宜一点
+[轮3] 不要日系品牌                ← 此时 brand_exclude 来自 phase 4-1
+[轮4] 想买保湿精华
+[轮5] 300 元以下                  ← price_max=300 来自 phase 4-1
+[轮6] 改成 100-200 之间
+[轮7] 再换一个清爽型的            ← 此时 needs_summary 触发！
+       └─ summarizer 把前 5 轮压成：「用户需适合油皮的洗面奶，明确约束
+          为价格更低、排除日系品牌，已推荐珊珂洁面...」
+[轮8] 帮我对比一下你刚才推荐的两款洗面奶
+       └─ LLM 跨过被摘要掉的早期 history，正确对比 p_beauty_011（珊珂，
+          来自 summary）+ p_beauty_018（来自最近原文），输出 GFM 表格
+          + 两张商品卡片
+```
+
+uvicorn 日志确认摘要触发：
+
+```
+session e762863a... 历史已摘要，summary=用户需适合油皮的洗面奶，明确约束为
+价格更低、排除日系品牌，已推荐珊珂洁面，暂未找到符合其要求的匹配商品，
+用户尚未选到心仪（保留最近 3 轮原文）
+```
+
+### (e) 与前序 Phase 的协同
+
+- **Phase 4-1 filter 跨轮保留**：`brand_exclude=[日系]`、`price_max=300` 这类硬约束在 summary 里以自然语言形式被记下（"排除日系品牌"/"价格更低"），后续轮次 LLM 自然延续；
+- **Phase 4-2 compare 跨轮可寻址**：用户说"对比你刚才推荐的两款"——summary 里保留 product_id 让 LLM 能精确锁定要对比的商品；
+- **Phase 4-3 clarify 后续接力**：触发 clarify 的轮次也会写进 history（user message + 空 assistant），下一轮用户回填 chip 后能基于完整上下文继续；
+- **iOS 端 phase3 零改动**：summary 写在服务端 session，客户端无感知。
+
+### Phase 4-4 复跑指令
+
+```bash
+cd server && source .venv/bin/activate
+
+# 1. 单测（11 memory + 6 summarizer + 2 prompts + 2 orchestrator）
+python -m pytest tests/test_memory.py tests/test_memory_summarizer.py tests/test_prompts.py tests/test_orchestrator.py -v
+
+# 2. 多轮 SSE smoke（同 session_id 跑 8 轮验证 summary 触发）
+uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+# 用 httpx 或自写 client 维持 session_id 跑 8 轮（脚本见 phase 4-4 章节示例）
+# 关注服务端 uvicorn 日志中 "历史已摘要" 行
 ```
 
 ---
