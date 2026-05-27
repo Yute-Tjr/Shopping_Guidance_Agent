@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 
 /// PriceCat 聊天主页：自绘品牌头 + 消息流 + 暖色输入栏。
@@ -23,12 +24,16 @@ struct ChatView: View {
         "送女朋友的口红选什么色号",
     ]
 
+    @State private var photosPickerItem: PhotosPickerItem? = nil
+
     init(env: AppEnvironment) {
         let api = APIClient(baseURL: env.baseURL)
         let transport = LiveChatTransport(api: api)
+        let upload = UploadService(baseURL: env.baseURL)
         _viewModel = StateObject(wrappedValue: ChatViewModel(
             transport: transport,
-            initialSessionID: env.sessionID
+            initialSessionID: env.sessionID,
+            uploadService: upload
         ))
     }
 
@@ -229,57 +234,105 @@ struct ChatView: View {
 
     private var inputBar: some View {
         let isInputEmpty = viewModel.inputText.trimmingCharacters(in: .whitespaces).isEmpty
-        let canSend = !viewModel.isSending && !isInputEmpty
+        let hasImage = viewModel.pickedImage != nil
+        let canSend = !viewModel.isSending && (!isInputEmpty || hasImage)
 
-        return HStack(spacing: Theme.Spacing.s) {
+        return VStack(spacing: 0) {
+            // Phase 5：上传错误/降级提示条
+            if let notice = viewModel.uploadNotice {
+                Text(notice)
+                    .font(Theme.Typo.caption())
+                    .foregroundStyle(Theme.Palette.priceHot)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Theme.Spacing.l)
+                    .padding(.top, 6)
+            }
+
+            // Phase 5：选好图但还没发送时显示的缩略图条
+            if let picked = viewModel.pickedImage {
+                HStack(spacing: Theme.Spacing.s) {
+                    if let uiimg = UIImage(contentsOfFile: picked.localURL.path) {
+                        Image(uiImage: uiimg)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 56, height: 56)
+                            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip))
+                    }
+                    Text("已选图，发送时一同上传")
+                        .font(Theme.Typo.caption())
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                    Spacer()
+                    Button {
+                        viewModel.pickedImage = nil
+                        photosPickerItem = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundColor(Theme.Palette.textSecondary)
+                            .imageScale(.large)
+                    }
+                }
+                .padding(.horizontal, Theme.Spacing.l)
+                .padding(.top, 8)
+            }
+
             HStack(spacing: Theme.Spacing.s) {
-                TextField(
-                    "",
-                    text: $viewModel.inputText,
-                    prompt: Text("说点什么，比如「200 元蓝牙耳机」")
-                        .foregroundColor(Theme.Palette.textPlaceholder),
-                    axis: .vertical
+                // Phase 5：相册入口
+                ImagePicker(
+                    selection: $photosPickerItem,
+                    picked: $viewModel.pickedImage,
+                    errorMessage: $viewModel.uploadNotice,
                 )
-                .font(Theme.Typo.body())
-                .foregroundStyle(Theme.Palette.textPrimary)
-                .lineLimit(1...4)
-                .focused($inputFocused)
-                .submitLabel(.send)
-                .onSubmit { Task { await viewModel.send() } }
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: Theme.Radius.pill, style: .continuous)
-                    .fill(Theme.Palette.surface)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: Theme.Radius.pill, style: .continuous)
-                    .stroke(inputFocused ? Theme.Palette.brand.opacity(0.5) : Theme.Palette.border,
-                            lineWidth: 1)
-            )
+                .frame(width: 32, height: 32)
 
-            Button {
-                inputFocused = false
-                Task { await viewModel.send() }
-            } label: {
-                Image(systemName: "arrow.up")
-                    .font(.system(size: 16, weight: .bold))
-                    .foregroundStyle(.white)
-                    .frame(width: 40, height: 40)
-                    .background(
-                        Circle()
-                            .fill(canSend ? Theme.Palette.brand : Theme.Palette.textPlaceholder)
+                HStack(spacing: Theme.Spacing.s) {
+                    TextField(
+                        "",
+                        text: $viewModel.inputText,
+                        prompt: Text("说点什么，比如「200 元蓝牙耳机」")
+                            .foregroundColor(Theme.Palette.textPlaceholder),
+                        axis: .vertical
                     )
-                    .themeShadow(canSend ? Theme.Shadow.lifted
-                                          : .init(color: .clear, radius: 0, x: 0, y: 0))
+                    .font(Theme.Typo.body())
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                    .lineLimit(1...4)
+                    .focused($inputFocused)
+                    .submitLabel(.send)
+                    .onSubmit { Task { await viewModel.send() } }
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(
+                    RoundedRectangle(cornerRadius: Theme.Radius.pill, style: .continuous)
+                        .fill(Theme.Palette.surface)
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: Theme.Radius.pill, style: .continuous)
+                        .stroke(inputFocused ? Theme.Palette.brand.opacity(0.5) : Theme.Palette.border,
+                                lineWidth: 1)
+                )
+
+                Button {
+                    inputFocused = false
+                    Task { await viewModel.send() }
+                } label: {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 40, height: 40)
+                        .background(
+                            Circle()
+                                .fill(canSend ? Theme.Palette.brand : Theme.Palette.textPlaceholder)
+                        )
+                        .themeShadow(canSend ? Theme.Shadow.lifted
+                                              : .init(color: .clear, radius: 0, x: 0, y: 0))
+                }
+                .disabled(!canSend)
+                .animation(.easeOut(duration: 0.15), value: canSend)
             }
-            .disabled(!canSend)
-            .animation(.easeOut(duration: 0.15), value: canSend)
+            .padding(.horizontal, Theme.Spacing.l)
+            .padding(.top, 10)
+            .padding(.bottom, 10)
         }
-        .padding(.horizontal, Theme.Spacing.l)
-        .padding(.top, 10)
-        .padding(.bottom, 10)
         .background(Theme.Palette.canvas)
     }
 }

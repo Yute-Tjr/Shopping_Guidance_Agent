@@ -1,0 +1,125 @@
+[
+  {
+    "case_id": "same-1",
+    "type": "same_item",
+    "image_path": "ecommerce_agent_dataset/3_服饰运动/images/p_clothes_007_live.jpg",
+    "text": "",
+    "expected_pids": ["p_clothes_007"],
+    "note": "Nike Air Zoom Pegasus 41 跑鞋自身"
+  },
+  {
+    "case_id": "same-2",
+    "type": "same_item",
+    "image_path": "ecommerce_agent_dataset/1_美妆护肤/images/p_beauty_002_live.jpg",
+    "text": "",
+    "expected_pids": ["p_beauty_002"],
+    "note": "兰蔻小黑瓶精华自身"
+  },
+  {
+    "case_id": "same-3",
+    "type": "same_item",
+    "image_path": "ecommerce_agent_dataset/2_数码电子/images/p_digital_001_live.jpg",
+    "text": "",
+    "expected_pids": ["p_digital_001"],
+    "note": "iPhone 17 Pro 自身"
+  },
+  {
+    "case_id": "same-4",
+    "type": "same_item",
+    "image_path": "ecommerce_agent_dataset/4_食品生活/images/p_food_001_live.jpg",
+    "text": "",
+    "expected_pids": ["p_food_001"],
+    "note": "三顿半冷萃咖啡自身"
+  },
+
+  {
+    "case_id": "similar-1",
+    "type": "similar",
+    "image_path": "ecommerce_agent_dataset/3_服饰运动/images/p_clothes_007_live.jpg",
+    "text": "类似的跑步鞋",
+    "expected_pids": ["p_clothes_007", "p_clothes_008", "p_clothes_009", "p_clothes_010"],
+    "note": "跑鞋同 sub_category：耐克 / 阿迪达斯 / HOKA / 特步"
+  },
+  {
+    "case_id": "similar-2",
+    "type": "similar",
+    "image_path": "ecommerce_agent_dataset/1_美妆护肤/images/p_beauty_002_live.jpg",
+    "text": "类似的精华",
+    "expected_pids": ["p_beauty_002", "p_beauty_001", "p_beauty_004", "p_beauty_005"],
+    "note": "兰蔻 / 雅诗兰黛 / 资生堂 / 科颜氏 精华同 sub_category"
+  },
+  {
+    "case_id": "similar-3",
+    "type": "similar",
+    "image_path": "ecommerce_agent_dataset/2_数码电子/images/p_digital_001_live.jpg",
+    "text": "类似的手机",
+    "expected_pids": ["p_digital_001", "p_digital_008"],
+    "note": "智能手机 sub_category：iPhone / 小米"
+  },
+  {
+    "case_id": "similar-4",
+    "type": "similar",
+    "image_path": "ecommerce_agent_dataset/4_食品生活/images/p_food_002_live.jpg",
+    "text": "类似的咖啡",
+    "expected_pids": ["p_food_001", "p_food_002"],
+    "note": "咖啡品类：三顿半 / 雀巢"
+  },
+  {
+    "case_id": "similar-5",
+    "type": "similar",
+    "image_path": "ecommerce_agent_dataset/3_服饰运动/images/p_clothes_011_live.jpg",
+    "text": "类似的篮球鞋",
+    "expected_pids": ["p_clothes_011", "p_clothes_012"],
+    "note": "篮球鞋 sub_category：耐克 / 安踏"
+  },
+
+  {
+    "case_id": "price-1",
+    "type": "image_plus_price",
+    "image_path": "ecommerce_agent_dataset/3_服饰运动/images/p_clothes_008_live.jpg",
+    "text": "1000 元以下的跑步鞋",
+    "expected_pids": ["p_clothes_007", "p_clothes_010"],
+    "note": "Ultraboost 5 ¥1399 → 排除自身；同品类 ≤¥1000：Pegasus 41 ¥899、特步 160X ¥999"
+  },
+  {
+    "case_id": "price-2",
+    "type": "image_plus_price",
+    "image_path": "ecommerce_agent_dataset/1_美妆护肤/images/p_beauty_001_live.jpg",
+    "text": "300 元以下的护肤",
+    "expected_pids": ["p_beauty_010", "p_beauty_006", "p_beauty_011"],
+    "note": "雅诗兰黛 ¥720 → 排除自身；护肤 ≤¥300：安热沙防晒 ¥298、欧莱雅 ¥170、珊珂洁面 ¥52"
+  },
+  {
+    "case_id": "price-3",
+    "type": "image_plus_price",
+    "image_path": "ecommerce_agent_dataset/1_美妆护肤/images/p_beauty_002_live.jpg",
+    "text": "600 以下的精华",
+    "expected_pids": ["p_beauty_004", "p_beauty_005"],
+    "note": "兰蔻小黑瓶 ¥760 → 排除；精华 ≤¥600：资生堂 ¥590、科颜氏 ¥520"
+  },
+
+  {
+    "case_id": "brand-exclude-1",
+    "type": "image_plus_brand_exclude",
+    "image_path": "ecommerce_agent_dataset/3_服饰运动/images/p_clothes_007_live.jpg",
+    "text": "不要耐克的跑鞋",
+    "expected_pids": ["p_clothes_008", "p_clothes_009", "p_clothes_010"],
+    "note": "Pegasus 41 是耐克 → 排除；同品类非耐克：阿迪达斯 / HOKA / 特步"
+  },
+  {
+    "case_id": "brand-exclude-2",
+    "type": "image_plus_brand_exclude",
+    "image_path": "ecommerce_agent_dataset/1_美妆护肤/images/p_beauty_001_live.jpg",
+    "text": "不要雅诗兰黛的精华",
+    "expected_pids": ["p_beauty_002", "p_beauty_004", "p_beauty_005"],
+    "note": "雅诗兰黛 → 排除；同品类非雅诗兰黛：兰蔻 / 资生堂 / 科颜氏"
+  },
+  {
+    "case_id": "brand-exclude-3",
+    "type": "image_plus_brand_exclude",
+    "image_path": "ecommerce_agent_dataset/2_数码电子/images/p_digital_001_live.jpg",
+    "text": "不要苹果的手机",
+    "expected_pids": ["p_digital_008"],
+    "note": "Apple → 排除；同品类非苹果：小米 17 Ultra"
+  }
+]

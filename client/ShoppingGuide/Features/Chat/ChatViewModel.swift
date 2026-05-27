@@ -19,28 +19,47 @@ public final class ChatViewModel: ObservableObject {
     @Published public var inputText: String = ""
     @Published public var isSending: Bool = false
     @Published public var sessionID: String?
+    /// Phase 5：用户选择/拍下的图片（上传 + 渲染气泡缩略图）。已发送后置 nil。
+    @Published public var pickedImage: PickedImage? = nil
+    /// Phase 5：上传 / 多模态错误的提示文案（如 vision API 限流降级时）。
+    @Published public var uploadNotice: String? = nil
 
     private let transport: ChatTransport
+    /// Phase 5：注入 UploadService 启用图片上传链路；nil 时纯文本模式（兼容测试 / pre-Phase5 场景）。
+    private let uploadService: UploadService?
 
-    public init(transport: ChatTransport, initialSessionID: String? = nil) {
+    public init(
+        transport: ChatTransport,
+        initialSessionID: String? = nil,
+        uploadService: UploadService? = nil
+    ) {
         self.transport = transport
         self.sessionID = initialSessionID
+        self.uploadService = uploadService
     }
 
-    /// 发送当前 inputText。空白直接忽略。
+    /// 发送当前 inputText（+ 可选 pickedImage）。空白且无图直接忽略。
     public func send() async {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        let picked = pickedImage
+        guard !text.isEmpty || picked != nil else { return }
         guard !isSending else { return }
 
-        let userMsg = ChatMessage(role: .user, text: text)
+        // 用户气泡：保留本地缩略图 URL，气泡渲染时直接显示
+        let userMsg = ChatMessage(
+            role: .user,
+            text: text,
+            localImageURL: picked?.localURL,
+        )
         messages.append(userMsg)
         var assistant = ChatMessage(role: .assistant, isStreaming: true)
         messages.append(assistant)
         let assistantIndex = messages.count - 1
 
         inputText = ""
+        pickedImage = nil
         isSending = true
+        uploadNotice = nil
         defer {
             // 兜底：循环里没拿到 .done 时也要清流式状态
             if assistantIndex < messages.count {
@@ -49,7 +68,27 @@ public final class ChatViewModel: ObservableObject {
             isSending = false
         }
 
-        for await event in transport.stream(message: text, sessionID: sessionID) {
+        // Phase 5：先上传图（如有），换 image_id；失败按降级策略分支处理
+        var imageID: String? = nil
+        if let picked, let upload = uploadService {
+            do {
+                imageID = try await upload.upload(image: picked.data)
+            } catch let UploadError.degraded(message) {
+                // 503：vision API 繁忙——保留用户消息（含缩略图），但下面继续发纯文本流
+                uploadNotice = "\(message)（已按文字继续）"
+            } catch {
+                // 其它错误：把错误挂到 assistant 气泡，停止本轮
+                messages[assistantIndex].errorNotice = "图片上传失败：\(error.localizedDescription)"
+                messages[assistantIndex].isStreaming = false
+                return
+            }
+        }
+
+        // 流式：带或不带 imageID
+        let messageToSend = text.isEmpty ? "看看这张图" : text
+        for await event in transport.stream(
+            message: messageToSend, sessionID: sessionID, imageID: imageID,
+        ) {
             switch event {
             case .session(let id):
                 sessionID = id
@@ -76,9 +115,11 @@ public final class ChatViewModel: ObservableObject {
         }
     }
 
-    /// 新建会话：清空消息 + sessionID。
+    /// 新建会话：清空消息 + sessionID + 取消未发送的图。
     public func resetSession() {
         messages.removeAll()
         sessionID = nil
+        pickedImage = nil
+        uploadNotice = nil
     }
 }

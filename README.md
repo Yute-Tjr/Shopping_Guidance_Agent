@@ -71,7 +71,7 @@ cd ./client
   - [x] 子项 2：多商品对比（CompareTargetExtractor + 并行检索 + GFM 表格 Prompt）([详情](#phase-4-2-多商品对比))
   - [x] 子项 3：主动澄清（ClarifyDetector + 13 类目 chips 模板）([详情](#phase-4-3-主动澄清))
   - [x] 子项 4：多轮 memory 摘要压缩（MemorySummarizer + summary 注入 prompt）([详情](#phase-4-4-多轮-memory-摘要压缩))
-- [~] **Phase 5**：多模态图搜（拍照找货）—— **server 侧已闭环**（Task 1-7）；iOS 接入 + 评测 + 文档收尾待办 ([详情](#phase-5-多模态图搜server-侧)，[设计文档](docs/05_多模态图搜设计.md)，[执行计划](docs/phase5_implementation_plan.md))
+- [~] **Phase 5**：多模态图搜（拍照找货）—— server + iOS 代码闭环，待真实灌图索引 + 评测 / 模拟器手动验收 ([详情](#phase-5-多模态图搜)，[设计文档](docs/05_多模态图搜设计.md)，[执行计划](docs/phase5_implementation_plan.md))
 - [ ] Phase 6：打磨与交付
 
 ---
@@ -823,11 +823,11 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 
 ---
 
-## Phase 5 多模态图搜（server 侧）
+## Phase 5 多模态图搜
 
 > 详细设计 [`docs/05_多模态图搜设计.md`](docs/05_多模态图搜设计.md)；执行计划 [`docs/phase5_implementation_plan.md`](docs/phase5_implementation_plan.md)。
 
-在 Phase 4 对话能力之上叠加**多模态输入路径**：iOS 端拍照/选图 + 可选文字 → 二段式上传 → vision embedding 检索 + Phase 4 结构化筛选融合 → 商品推荐流。本节落地 server 侧 Task 1-7（**iOS 接入 + 黄金集评测 + 文档收尾在 Task 8-11**）。
+在 Phase 4 对话能力之上叠加**多模态输入路径**：iOS 端拍照/选图 + 可选文字 → 二段式上传 → vision embedding 检索 + Phase 4 结构化筛选融合 → 商品推荐流。Task 1-7 = server 侧闭环，Task 8-9 = iOS 闭环，Task 10 = 黄金集评测，Task 11 = 文档收尾。
 
 ### (a) 核心设计抉择
 
@@ -895,7 +895,25 @@ POST /api/v1/chat/stream { "message":"找类似的，1000 以下", "image_id":"<
 | Milvus 命中空 | 走 Phase 2 已有的"未找到匹配商品"话术，**不**输出 product_cards 围栏 |
 | LLM 流式异常 | 复用 Phase 2 降级链路：emit `error` event + Top-K retrieved 直接 hydrate 成卡片兜底 |
 
-### (e) 测试覆盖（server 侧新增 26 条）
+### (e) iOS 端模块（Task 8-9）
+
+| 文件 | 作用 |
+| --- | --- |
+| [`client/ShoppingGuide/Models/PickedImage.swift`](client/ShoppingGuide/Models/PickedImage.swift) | **新增**。纯 value type（`Data + URL`，不依赖 UIKit），让 `ChatViewModel`（SPM macOS 测试目标可见）和 `ImagePicker`（iOS UIKit/PhotosUI only）能共享同一个值类型 |
+| [`client/ShoppingGuide/Models/ChatMessage.swift`](client/ShoppingGuide/Models/ChatMessage.swift) | **修改**。加 `localImageURL: URL?` 字段。用户气泡渲染时直接用 `UIImage(contentsOfFile:)` 加载——不依赖网络免去 AsyncImage 闪烁 |
+| [`client/ShoppingGuide/Features/Chat/ImagePicker.swift`](client/ShoppingGuide/Features/Chat/ImagePicker.swift) | **新增**。`PhotosPicker` 封装 + `loadAndCompress`：短边 ≤ 1600 + JPEG 质量逐级降直到 ≤ 1 MB，对齐后端 `_MAX_BYTES`；输出 `PickedImage(data, localURL)` 写到 `FileManager.default.temporaryDirectory` |
+| [`client/ShoppingGuide/Networking/UploadService.swift`](client/ShoppingGuide/Networking/UploadService.swift) | **新增**。`POST /api/v1/upload/image` multipart 客户端。区分三种错误：`.invalidResponse` / `.server(status, message)` / `.degraded(message)` —— 503 + `fallback_text_only` 解析后抛 `.degraded`，让 VM 走"保留缩略图但只发文字"的降级路径 |
+| [`client/ShoppingGuide/Features/Chat/ChatTransport.swift`](client/ShoppingGuide/Features/Chat/ChatTransport.swift) | **修改**。protocol `stream(message:sessionID:imageID:)` 加 imageID 参数；extension 给旧 2 参形态保留默认 nil 兜底，FakeChatTransport / 历史调用点零回退 |
+| [`client/ShoppingGuide/Features/Chat/ChatViewModel.swift`](client/ShoppingGuide/Features/Chat/ChatViewModel.swift) | **修改**。注入 `UploadService` + `@Published pickedImage / uploadNotice`；`send()` 重构成 "上传 → 拿 image_id → 流式" 编排，含 503 降级路径（保留缩略图但只发文字）和其它错误把 notice 挂到 assistant 气泡中断本轮 |
+| [`client/ShoppingGuide/Features/Chat/ChatView.swift`](client/ShoppingGuide/Features/Chat/ChatView.swift) | **修改**。`init` 注入 `UploadService(baseURL: env.baseURL)`；输入栏左侧加 `ImagePicker` 相机按钮；输入栏上方加缩略图条 + 关闭按钮 + 错误提示条；`canSend` 逻辑改为「文本非空 **或** 已选图」 |
+| [`client/ShoppingGuide/Features/Chat/MessageBubble.swift`](client/ShoppingGuide/Features/Chat/MessageBubble.swift) | **修改**。用户气泡顶部嵌 `localImageURL` 加载的缩略图（最大 200×200，`Theme.Radius.chip` 圆角），与现有 user/assistant 气泡渲染保持视觉一致 |
+| [`client/Package.swift`](client/Package.swift) | **修改**。`Features/Chat/ImagePicker.swift` 加进 SPM exclude（macOS 测试目标不含 UIKit/PhotosUI） |
+
+iOS 端额外验证（Step 9.4-9.5）：选图 → 缩略图条出现 → 发送 → 用户气泡上嵌缩略图 → 服务端 `upload 成功：image_id=...` → SSE 流回卡片；同款命中验证：把 `p_clothes_007_live.jpg` 放进模拟器相册，文字「找同款」→ Top-1 卡片 product_id == `p_clothes_007`。
+
+### (f) 测试覆盖
+
+**Server 侧新增 26 条单测**：
 
 | 文件 | n | 覆盖点 |
 | --- | --- | --- |
@@ -908,13 +926,31 @@ POST /api/v1/chat/stream { "message":"找类似的，1000 以下", "image_id":"<
 
 **全套 server 测试：178 (Phase 4 baseline) + 26 (Phase 5) = 204 passed**。
 
-### (f) 待办（Task 8-11）
+**iOS 端**：`xcodebuild -destination 'platform=iOS Simulator,name=iPhone 17' build` → **BUILD SUCCEEDED**。Step 9.4-9.5 模拟器 e2e（拍照 / 选商品自身图同款命中）属手动验收。
 
-- **Task 8-9** iOS 端：`ImagePicker` + `UploadService` + ChatView 相机按钮 + MessageBubble 缩略图气泡；
-- **Task 10** 评测：15 条黄金集（4 类——同款 / 相似 / 图+价格 / 图+品牌排除）+ `eval_image_search.py` 跑 Top-1/3/5 指标 + `smoke_image_chat.sh` 端到端冒烟；
-- **Task 11** 文档收尾：评测报告 `docs/phase5_eval_report.md` + 把"server 侧已完成"改成"Phase 5 完成"。
+### (g) 评测黄金集（Task 10）
 
-### Phase 5 server 侧复跑指令
+`server/scripts/eval/image_queries.json` 共 **15 条 case**，按 4 类拆分：
+
+| 类型 | n | 验证点 |
+| --- | --- | --- |
+| `same_item` | 4 | 上传数据集内某商品的 `_live.jpg`，Top-1 应命中自身（向量空间对自身的还原能力） |
+| `similar` | 5 | 上传 + 文字「类似的 X」，Top-3 应覆盖同 sub_category 的其它候选（跑鞋 / 精华 / 智能手机 / 咖啡 / 篮球鞋） |
+| `image_plus_price` | 3 | 上传 + 「≤ X 元的 Y」，Top-3 应只剩同品类 + 价格区间内的候选；验证 query_rewriter 抽 `price_max` 后 filter_expr 与 chunk_type 双重 AND |
+| `image_plus_brand_exclude` | 3 | 上传 + 「不要 X 品牌的」，Top-3 应排除上传图自身品牌；验证 `brands_exclude` 在多模态分支生效 |
+
+`server/scripts/eval_image_search.py` 跑 Top-1/3/5 指标输出到 `docs/phase5_eval_report.md`；`server/scripts/smoke_image_chat.sh` 跑端到端冒烟（upload → chat），全部用真实 `p_clothes_007_live.jpg` (Nike Pegasus 41) 作默认图。
+
+### (h) 待跑（手动操作）
+
+| 步骤 | 命令 | 依赖 |
+| --- | --- | --- |
+| 灌图索引 | `python -m scripts.build_image_index --rebuild` | Doubao vision API 配额（100 张图 × ~600-1200ms） |
+| 跑黄金集评测 | `python -m scripts.eval_image_search --output ../docs/phase5_eval_report.md` | 灌图完成 + vision API 可用 |
+| 起服务跑 smoke | `uvicorn app.main:app & bash scripts/smoke_image_chat.sh` | 灌图完成 |
+| iOS 模拟器 e2e | 在 Xcode 启动 iPhone 17 模拟器 → 把 `p_clothes_007_live.jpg` 拖进相册 → 选图 + 「找同款」→ Top-1 卡片 == `p_clothes_007` | 服务起着 + Phase 5 索引就位 |
+
+### Phase 5 复跑指令
 
 ```bash
 cd server && source .venv/bin/activate
@@ -922,22 +958,24 @@ cd server && source .venv/bin/activate
 # 1. 单测（server 侧 204 全过，含 Phase 5 新增 26）
 python -m pytest tests/ -q
 
-# 2. 图索引灌入（消耗 vision API 配额）
+# 2. 图索引灌入（消耗 vision API 配额，100 张图约 1-2 分钟）
 python -m scripts.build_image_index --limit 3    # 先冒烟 3 件
 python -m scripts.build_image_index --rebuild    # 全量 100 件
 
-# 3. 起服务
+# 3. 跑黄金集评测，生成 docs/phase5_eval_report.md
+python -m scripts.eval_image_search --output ../docs/phase5_eval_report.md
+
+# 4. 端到端冒烟
 uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+bash scripts/smoke_image_chat.sh   # 默认上传 p_clothes_007，message="找同款"
 
-# 4. 上传图 → 拿 image_id
-curl -s -X POST http://127.0.0.1:8000/api/v1/upload/image \
-  -F "file=@../ecommerce_agent_dataset/3_服饰运动/images/p_sneaker_005_live.jpg;type=image/jpeg"
-# → {"image_id":"<uuid>","preview_url":"/static_uploads/<uuid>.jpg"}
-
-# 5. 带 image_id 调 chat（看 SSE 流里有 product_card 事件即通）
-curl -N -s -X POST http://127.0.0.1:8000/api/v1/chat/stream \
-  -H "Content-Type: application/json" \
-  -d '{"message":"找同款","image_id":"<上一步的 uuid>"}'
+# 5. iOS 端
+cd ../client
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  xcodebuild -project ShoppingGuide.xcodeproj -scheme ShoppingGuide \
+  -destination 'platform=iOS Simulator,name=iPhone 17' build
+# Xcode 启动模拟器 → 把 ecommerce_agent_dataset 里某商品 _live.jpg
+# 拖进模拟器照片库 → app 内点相机按钮选图 → 发送 "找同款"
 ```
 
 ---

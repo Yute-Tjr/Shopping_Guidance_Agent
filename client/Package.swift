@@ -30,6 +30,7 @@ let package = Package(
                 "Features/Chat/ChatView.swift",
                 "Features/Chat/MessageBubble.swift",
                 "Features/Chat/ClarifyChipsView.swift",
+                "Features/Chat/ImagePicker.swift",   // 引 UIKit/PhotosUI，macOS 测试不编译
                 "Features/Product/ProductCardView.swift",
                 "Features/Product/ProductDetailView.swift",
                 "Components/MarkdownView.swift",

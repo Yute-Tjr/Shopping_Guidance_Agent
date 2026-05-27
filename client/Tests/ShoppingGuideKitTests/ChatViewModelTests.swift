@@ -6,7 +6,7 @@ import Testing
 struct FakeChatTransport: ChatTransport {
     let events: [SSEEvent]
 
-    func stream(message: String, sessionID: String?) -> AsyncStream<SSEEvent> {
+    func stream(message: String, sessionID: String?, imageID: String?) -> AsyncStream<SSEEvent> {
         let captured = events
         return AsyncStream { continuation in
             for e in captured { continuation.yield(e) }

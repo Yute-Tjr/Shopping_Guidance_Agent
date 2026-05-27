@@ -145,6 +145,16 @@ struct MessageBubble: View {
 
         // 用户气泡用纯 Text（用户输入不需 markdown 渲染）；assistant 走 MarkdownView 支持表格。
         VStack(alignment: .leading, spacing: 6) {
+            // Phase 5：用户消息携带 localImageURL 时把缩略图嵌进气泡顶部
+            if isUser, let url = message.localImageURL,
+               let uiimg = UIImage(contentsOfFile: url.path) {
+                Image(uiImage: uiimg)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: 200, maxHeight: 200)
+                    .clipped()
+                    .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip, style: .continuous))
+            }
             if !displayText.isEmpty {
                 if isUser {
                     Text(displayText)
