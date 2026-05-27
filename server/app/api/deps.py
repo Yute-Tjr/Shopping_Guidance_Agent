@@ -12,8 +12,10 @@ from app.agent.clarify_detector import ClarifyDetector, build_clarify_detector
 from app.agent.compare_planner import CompareTargetExtractor, build_compare_extractor
 from app.agent.memory import ConversationMemory, get_memory
 from app.agent.memory_summarizer import MemorySummarizer, build_memory_summarizer
+from app.agent.multimodal_branch import MultimodalBranch, build_multimodal_branch
 from app.agent.orchestrator import AgentOrchestrator
 from app.agent.query_rewriter import QueryRewriter, build_query_rewriter
+from app.config import settings
 from app.db.product_repo import ProductRepository, get_product_repository
 from app.llm.doubao_client import DoubaoChatClient, build_chat_client_from_settings
 from app.rag.retriever import RagRetriever, build_retriever_from_settings
@@ -71,8 +73,39 @@ def get_orchestrator() -> AgentOrchestrator:
         clarify_detector=get_clarify_detector(),
         memory_summarizer=get_memory_summarizer(),
         structured_retriever=get_structured_retriever(),
+        multimodal_branch=get_multimodal_branch(),
     )
 
 
 def get_product_repo() -> ProductRepository:
     return get_product_repository()
+
+
+@lru_cache(maxsize=1)
+def get_image_embed_cache() -> "ImageEmbedCache":
+    """全局唯一 image embedding 缓存（Phase 5）。"""
+    from app.rag.image_embed_cache import ImageEmbedCache
+    return ImageEmbedCache(capacity=100, ttl_seconds=1800.0)
+
+
+@lru_cache(maxsize=1)
+def get_multimodal_branch() -> MultimodalBranch:
+    """Phase 5 图文融合分支单例。"""
+    return build_multimodal_branch(
+        embedder=get_retriever().embedder,
+        retriever=get_retriever(),
+        cache=get_image_embed_cache(),
+        query_rewriter=get_query_rewriter(),
+        structured_retriever=get_structured_retriever(),
+    )
+
+
+def get_upload_dir() -> "Path":
+    """上传图落盘根目录。按日期分子目录，自动 mkdir。"""
+    from datetime import datetime
+    from pathlib import Path
+    root = Path(getattr(settings, "upload_root", "data/uploads"))
+    today = datetime.now().strftime("%Y%m%d")
+    p = root / today
+    p.mkdir(parents=True, exist_ok=True)
+    return p

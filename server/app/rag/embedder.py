@@ -13,8 +13,10 @@
 """
 from __future__ import annotations
 
+import base64
 import math
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Iterable, Sequence
 
 from tenacity import (
@@ -121,6 +123,83 @@ class DoubaoEmbedder:
 
     def embed_one(self, text: str) -> list[float]:
         vec = self._embed_one_text(text)
+        if self._dim is None:
+            self._dim = len(vec)
+        return l2_normalize(vec) if self.normalize else list(vec)
+
+    # ---------- 多模态接口（Phase 5） ----------
+
+    @staticmethod
+    def _image_data_url(image_path: str) -> str:
+        """把本地图转 base64 data URL，doubao multimodal API 接受 data: 形态。"""
+        p = Path(image_path)
+        if not p.exists():
+            raise FileNotFoundError(f"图片不存在：{image_path}")
+        suffix = p.suffix.lower()
+        if suffix in (".jpg", ".jpeg"):
+            mime = "image/jpeg"
+        elif suffix == ".png":
+            mime = "image/png"
+        elif suffix == ".webp":
+            mime = "image/webp"
+        else:
+            raise ValueError(f"不支持的图片格式：{suffix}")
+        b64 = base64.b64encode(p.read_bytes()).decode("ascii")
+        return f"data:{mime};base64,{b64}"
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+        reraise=True,
+    )
+    def _embed_one_image(self, image_path: str) -> list[float]:
+        """单张图 embedding；失败按 tenacity 配置重试。"""
+        url = self._image_data_url(image_path)
+        resp = self.client.multimodal_embeddings.create(
+            model=self.model,
+            input=[{"type": "image_url", "image_url": {"url": url}}],
+        )
+        return resp.data.embedding
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, max=10),
+        retry=retry_if_exception_type(RETRYABLE_EXCEPTIONS),
+        reraise=True,
+    )
+    def _embed_one_multimodal(self, *, text: str | None, image_path: str | None) -> list[float]:
+        """图 + 文一次性 embedding，返回单个统一向量。"""
+        parts: list[dict] = []
+        if text:
+            parts.append({"type": "text", "text": text.strip()})
+        if image_path:
+            parts.append({"type": "image_url", "image_url": {"url": self._image_data_url(image_path)}})
+        if not parts:
+            raise ValueError("embed_multimodal 至少需要 text 或 image_path 之一")
+        resp = self.client.multimodal_embeddings.create(
+            model=self.model,
+            input=parts,
+        )
+        return resp.data.embedding
+
+    def embed_image(self, image_path: str) -> list[float]:
+        """公开接口：单张图 → 归一化向量。"""
+        vec = self._embed_one_image(image_path)
+        if self._dim is None:
+            self._dim = len(vec)
+        return l2_normalize(vec) if self.normalize else list(vec)
+
+    def embed_multimodal(
+        self,
+        *,
+        text: str | None = None,
+        image_path: str | None = None,
+    ) -> list[float]:
+        """公开接口：图+文 / 仅图 / 仅文 → 归一化向量。"""
+        if not text and not image_path:
+            raise ValueError("embed_multimodal 至少需要 text 或 image_path 之一")
+        vec = self._embed_one_multimodal(text=text, image_path=image_path)
         if self._dim is None:
             self._dim = len(vec)
         return l2_normalize(vec) if self.normalize else list(vec)

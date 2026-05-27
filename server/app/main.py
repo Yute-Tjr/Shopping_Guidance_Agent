@@ -15,6 +15,7 @@ from sqlalchemy import text
 
 from app.api.chat import router as chat_router
 from app.api.products import router as products_router
+from app.api.upload import router as upload_router
 from app.config import settings
 from app.db.mysql_session import engine
 from app.utils.logger import get_logger
@@ -76,6 +77,7 @@ else:
 # Phase 2 路由统一挂在 /api/v1 前缀下（docs/03 §3.1）。
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(products_router, prefix="/api/v1")
+app.include_router(upload_router, prefix="/api/v1")
 
 
 @app.get("/")

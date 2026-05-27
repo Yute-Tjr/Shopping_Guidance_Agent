@@ -123,3 +123,64 @@ def test_compare_messages_include_two_products():
     assert "p_b" in joined
     # 对比 Prompt 至少要点名结构化输出（表格 / 维度对比）
     assert "对比" in msgs[0]["content"]
+
+
+def test_build_image_search_messages_includes_contradiction_rule():
+    """图文矛盾以文字为准——必须在 system prompt 里明示。"""
+    from app.agent.prompts import build_image_search_messages
+    from app.rag.retriever import RetrievedProduct
+
+    retrieved = [
+        RetrievedProduct(
+            product_id="p_001",
+            score=0.9,
+            brand="兰蔻",
+            category="美妆",
+            sub_category="精华",
+            base_price=200.0,
+            best_chunk_text="兰蔻小黑瓶",
+            supporting_chunks=["兰蔻小黑瓶"],
+            title="兰蔻小黑瓶精华液 30ml",
+        ),
+    ]
+    msgs = build_image_search_messages(
+        user_message="这个，但要便宜一点的",
+        image_path="/data/uploads/20260527/abc.jpg",
+        retrieved=retrieved,
+        history=None,
+        summary=None,
+    )
+    system = msgs[0]["content"]
+    assert "图文矛盾" in system or "以文字为准" in system
+    # image_path 本身**不应**出现在 system prompt 里（防泄漏到 LLM 上下文）
+    assert "/data/uploads/" not in system
+    assert "abc.jpg" not in system
+
+
+def test_build_image_search_messages_uses_retrieved_block():
+    """retrieved_products 块仍走标准 _format_retrieved_block。"""
+    from app.agent.prompts import build_image_search_messages
+    from app.rag.retriever import RetrievedProduct
+
+    retrieved = [
+        RetrievedProduct(
+            product_id="p_002",
+            score=0.85,
+            brand="The Ordinary",
+            category="美妆",
+            sub_category="精华",
+            base_price=80.0,
+            min_sku_price=70.0,
+            max_sku_price=90.0,
+            best_chunk_text="烟酰胺精华",
+            supporting_chunks=["烟酰胺精华"],
+            title="The Ordinary 烟酰胺 10% + 锌 1% 精华",
+        ),
+    ]
+    msgs = build_image_search_messages(
+        user_message="找同款", image_path="/tmp/x.jpg",
+        retrieved=retrieved, history=None, summary=None,
+    )
+    system = msgs[0]["content"]
+    assert "p_002" in system
+    assert "名称=The Ordinary" in system or "The Ordinary" in system

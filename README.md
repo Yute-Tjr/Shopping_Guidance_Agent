@@ -71,7 +71,7 @@ cd ./client
   - [x] 子项 2：多商品对比（CompareTargetExtractor + 并行检索 + GFM 表格 Prompt）([详情](#phase-4-2-多商品对比))
   - [x] 子项 3：主动澄清（ClarifyDetector + 13 类目 chips 模板）([详情](#phase-4-3-主动澄清))
   - [x] 子项 4：多轮 memory 摘要压缩（MemorySummarizer + summary 注入 prompt）([详情](#phase-4-4-多轮-memory-摘要压缩))
-- [ ] Phase 5：加分项（业务闭环 / 多模态 / 性能）
+- [~] **Phase 5**：多模态图搜（拍照找货）—— **server 侧已闭环**（Task 1-7）；iOS 接入 + 评测 + 文档收尾待办 ([详情](#phase-5-多模态图搜server-侧)，[设计文档](docs/05_多模态图搜设计.md)，[执行计划](docs/phase5_implementation_plan.md))
 - [ ] Phase 6：打磨与交付
 
 ---
@@ -819,6 +819,125 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 #   - "走 SQL fallback (price_min=..., price_max=...)" → R4 链路
 #   - "session ... 历史已摘要" → memory summarize 触发
 #   - "compare targets=[...]" → R3 链路
+```
+
+---
+
+## Phase 5 多模态图搜（server 侧）
+
+> 详细设计 [`docs/05_多模态图搜设计.md`](docs/05_多模态图搜设计.md)；执行计划 [`docs/phase5_implementation_plan.md`](docs/phase5_implementation_plan.md)。
+
+在 Phase 4 对话能力之上叠加**多模态输入路径**：iOS 端拍照/选图 + 可选文字 → 二段式上传 → vision embedding 检索 + Phase 4 结构化筛选融合 → 商品推荐流。本节落地 server 侧 Task 1-7（**iOS 接入 + 黄金集评测 + 文档收尾在 Task 8-11**）。
+
+### (a) 核心设计抉择
+
+1. **共享向量空间**：Doubao `multimodal_embeddings` 把图与文编码到同一 2048 维空间，**沿用 Phase 1 的 `products_text` collection**，新增 `chunk_type='image'` 标量字段隔离——零迁移，文本检索完全不受影响。
+2. **二段式 API**：`POST /upload/image` → `image_id` → `POST /chat {message, image_id}`。上传时**同步算 vision embedding** 缓存到 `ImageEmbedCache`（LRU+TTL），让 `/chat` 路径首 token 不再阻塞在 ~600-1200ms 的 vision 编码上。
+3. **单向量多模态融合**：图+文一次性 embed → 单查询向量；价格/品牌/品类等结构化条件仍走 Phase 4 `query_rewriter` 抽 + scalar filter。retrieve 路径**仍是一次 milvus search**，filter_expr 多挂一个 `chunk_type in ['image','title']` 让标题命中也参与召回。
+4. **图文矛盾**：retrieve 层不做仲裁；Prompt 加规则「用户文字与图明显矛盾时以文字为准」由 LLM 处理。
+5. **任意一环失败可退化**：vision API 限流 / 落盘图丢失 / Milvus 空结果 → 全部能退化到纯文本流，绝不出现「上传图后对话卡死」。
+6. **Phase 1-4 零回退**：Phase 5 是纯增量，新增分支处理器 `MultimodalBranch` 与 `clarify_detector` / `compare_planner` 同层级；orchestrator 入口按 `image_id` 是否非空决定走 Phase 4 还是 Phase 5 路径；纯文本对话体验完全不变。
+
+### (b) 模块分层
+
+| 文件 | 作用 |
+| --- | --- |
+| [`server/app/rag/image_embed_cache.py`](server/app/rag/image_embed_cache.py) | **新增**。`ImageEmbedCache`：LRU + TTL（默认 cap=100 / 30min）+ `asyncio.Lock` 写并发保护。给 upload 路径和 multimodal_branch 共用，避免 retriever 内放缓存形成交叉依赖 |
+| [`server/app/rag/embedder.py`](server/app/rag/embedder.py) | **修改**。`DoubaoEmbedder` 加 `embed_image(path)` / `embed_multimodal(text, image_path)` 两个公开接口；内部 `_image_data_url` 把本地图转 base64 data URL，遵循 Doubao multimodal_embeddings 的 input parts 协议。复用同一 retry / L2 归一化基础设施 |
+| [`server/scripts/build_image_index.py`](server/scripts/build_image_index.py) | **新增**。增量灌入脚本：遍历数据集每件商品的 `<pid>_live.jpg` → `embed_image` → 写 `products_text` collection（`chunk_type='image'`，幂等 by source_id）；`--limit N` 调试用、`--rebuild` 全量重灌、末尾 sanity probe 自检 Top-1 |
+| [`server/app/api/upload.py`](server/app/api/upload.py) | **新增**。`POST /api/v1/upload/image`：MIME 白名单（jpeg/png/webp）+ 1MB 上限 + Pillow `verify()` 防破损 + 落盘日期分目录 + **同步算 vision embedding 缓存**。失败时返 503 + `fallback_text_only: true` 让 iOS 端能优雅降级到纯文本 |
+| [`server/app/agent/prompts.py`](server/app/agent/prompts.py) | **修改**。新增 `build_image_search_messages`：在 `_BASE_RULES` 上叠加图文融合规则（图文矛盾以文字为准 / 不评价相似度由检索算 / image_path 不泄漏到 system prompt），复用 `_format_retrieved_block` / `_format_summary_block` |
+| [`server/app/agent/multimodal_branch.py`](server/app/agent/multimodal_branch.py) | **新增**。`MultimodalBranch.handle(message, image_id, history, summary)` → 缓存命中即取 vec / miss 时走 `_resolve_path` + `embed_multimodal` 重算并回填，落盘图丢失自动退化纯文本（`image_lost=True`）。`filter_expr` = `query_rewriter` 结构化条件 AND `chunk_type in ['image','title']`，绕过 `RagRetriever.search` 的 embed 步骤直查底层 `store.search` 复用 `_aggregate` |
+| [`server/app/agent/orchestrator.py`](server/app/agent/orchestrator.py) | **修改**。`__init__` 加 `multimodal_branch` 参数（缺省 None 时 Phase 5 路径全关）；`orchestrate` 入口加 image_id 分流——非空且 branch 注入则短路 intent 判定，调用 `_multimodal_orchestrate` 走图文流。该子方法把 `MultimodalBranch.handle` 返回的 retrieved 喂给 `build_image_search_messages` → LLM 流 → `ProductCardExtractor` → `_hydrate_card`，**LLM 异常时复用 Phase 2 的 Top-K 兜底链路** |
+| [`server/app/api/deps.py`](server/app/api/deps.py) | **修改**。`get_image_embed_cache` / `get_upload_dir` / `get_multimodal_branch` 三个新工厂；`get_orchestrator` 装配时注入 `multimodal_branch=get_multimodal_branch()` |
+| [`server/app/main.py`](server/app/main.py) | **修改**。注册 `upload_router` 在 `/api/v1` 前缀下 |
+
+### (c) 数据流（典型一轮图文对话）
+
+```
+[iOS] 用户拍照 / 选图 + 输入"找类似的，1000 以下"
+   │
+   ▼
+POST /api/v1/upload/image (multipart)
+   │  ├─ MIME / size / Pillow verify 校验
+   │  ├─ 落盘到 data/uploads/YYYYMMDD/<uuid>.jpg
+   │  ├─ 同步 embedder.embed_image(path)  ← ~600-1200ms vision API
+   │  └─ cache.put(image_id, vec, path)   ← LRU+TTL
+   ▼
+{ "image_id": "<uuid>", "preview_url": "..." }
+   │
+   ▼
+POST /api/v1/chat/stream { "message":"找类似的，1000 以下", "image_id":"<uuid>" }
+   │
+   ▼ orchestrate()
+   │  ├─ image_id 非空 → 短路到 _multimodal_orchestrate
+   │  │
+   │  ▼ MultimodalBranch.handle()
+   │     ├─ cache.get(image_id) → 命中：直接拿 vec (路径)
+   │     │                       miss：embed_multimodal(text=, image=) 重算回填
+   │     ├─ query_rewriter.parse("找类似的，1000 以下")
+   │     │    → ParsedQuery(search_query="找类似的", price_max=1000.0)
+   │     ├─ filter_expr = "(max_sku_price <= 1000.0) and chunk_type in ['image','title']"
+   │     └─ store.search(query_vector=vec, filter=...) → _aggregate Top-5
+   │
+   ▼ build_image_search_messages(retrieved, summary, history)
+   ▼ llm.chat_stream → token / product_card 事件流
+   ▼ memory.save_turn → done
+```
+
+### (d) 失败路径与降级（设计原则：任何一环挂都不能让对话卡死）
+
+| 失败点 | 处理 |
+| --- | --- |
+| 上传 vision embedding 失败（限流 / 5xx） | `/upload/image` 返 503 + `fallback_text_only: true`；iOS 端可继续用纯文本 chat |
+| 缓存 miss + 落盘图也找不到 | `MultimodalBranch.handle` 捕 `FileNotFoundError` → `embed_multimodal(text=msg, image_path=None)` 退化纯文本 embed，`image_lost=True` 让 orchestrator emit `warning` event |
+| `query_rewriter` LLM 异常 | 按 identity ParsedQuery 兜底，filter 只剩 `chunk_type in ['image','title']` |
+| Milvus 命中空 | 走 Phase 2 已有的"未找到匹配商品"话术，**不**输出 product_cards 围栏 |
+| LLM 流式异常 | 复用 Phase 2 降级链路：emit `error` event + Top-K retrieved 直接 hydrate 成卡片兜底 |
+
+### (e) 测试覆盖（server 侧新增 26 条）
+
+| 文件 | n | 覆盖点 |
+| --- | --- | --- |
+| `tests/test_image_embed_cache.py` | 5 | put/get 往返 / TTL 过期 / LRU 驱逐顺序 / 并发 50 写不撕裂 / 缺失 key 返 None |
+| `tests/test_embedder.py` | 7 | `embed_image` L2 归一化 + data URL 形态 / 缺图抛 FileNotFoundError / `embed_multimodal` 图+文 / 仅文 / 双空抛 ValueError / `l2_normalize` 含零向量 |
+| `tests/test_upload_api.py` | 6 | happy path 返 image_id + 落盘 + 缓存写入 / 415 不支持 MIME / 413 超 1MB / 422 破损图 / 400 空文件 / 503 vision API 失败降级 |
+| `tests/test_prompts.py` | +2 | `build_image_search_messages` 含"图文矛盾"/"以文字为准"规则 / image_path 不泄漏到 system prompt / 复用 retrieved_products 块 |
+| `tests/test_multimodal_branch.py` | 5 | 缓存命中走旧 vec / miss 时 fallback resolver 重算 / filter_expr 自动叠 chunk_type / 结构化 filter AND chunk_type / 落盘图丢失退化纯文本 |
+| `tests/test_orchestrator.py` | +1 | image_id 非空 → MultimodalBranch.handle 被调用 / image_id 为空 → 不触达 |
+
+**全套 server 测试：178 (Phase 4 baseline) + 26 (Phase 5) = 204 passed**。
+
+### (f) 待办（Task 8-11）
+
+- **Task 8-9** iOS 端：`ImagePicker` + `UploadService` + ChatView 相机按钮 + MessageBubble 缩略图气泡；
+- **Task 10** 评测：15 条黄金集（4 类——同款 / 相似 / 图+价格 / 图+品牌排除）+ `eval_image_search.py` 跑 Top-1/3/5 指标 + `smoke_image_chat.sh` 端到端冒烟；
+- **Task 11** 文档收尾：评测报告 `docs/phase5_eval_report.md` + 把"server 侧已完成"改成"Phase 5 完成"。
+
+### Phase 5 server 侧复跑指令
+
+```bash
+cd server && source .venv/bin/activate
+
+# 1. 单测（server 侧 204 全过，含 Phase 5 新增 26）
+python -m pytest tests/ -q
+
+# 2. 图索引灌入（消耗 vision API 配额）
+python -m scripts.build_image_index --limit 3    # 先冒烟 3 件
+python -m scripts.build_image_index --rebuild    # 全量 100 件
+
+# 3. 起服务
+uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+
+# 4. 上传图 → 拿 image_id
+curl -s -X POST http://127.0.0.1:8000/api/v1/upload/image \
+  -F "file=@../ecommerce_agent_dataset/3_服饰运动/images/p_sneaker_005_live.jpg;type=image/jpeg"
+# → {"image_id":"<uuid>","preview_url":"/static_uploads/<uuid>.jpg"}
+
+# 5. 带 image_id 调 chat（看 SSE 流里有 product_card 事件即通）
+curl -N -s -X POST http://127.0.0.1:8000/api/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message":"找同款","image_id":"<上一步的 uuid>"}'
 ```
 
 ---

@@ -22,6 +22,7 @@ from app.agent.compare_planner import CompareTargetExtractor
 from app.agent.intent import IntentRouter
 from app.agent.memory import ConversationMemory
 from app.agent.memory_summarizer import MemorySummarizer
+from app.agent.multimodal_branch import MultimodalBranch
 from app.agent.prompts import build_compare_messages, build_recommend_messages
 from app.agent.query_rewriter import ParsedQuery, QueryRewriter
 from app.rag.retriever import RetrievedProduct
@@ -64,6 +65,7 @@ class AgentOrchestrator:
         clarify_detector: ClarifyDetector | None = None,
         memory_summarizer: MemorySummarizer | None = None,
         structured_retriever: StructuredRetriever | None = None,
+        multimodal_branch: MultimodalBranch | None = None,
     ) -> None:
         self.retriever = retriever
         self.llm = llm
@@ -81,10 +83,18 @@ class AgentOrchestrator:
         self.memory_summarizer = memory_summarizer
         # structured_retriever 缺省时不启用 SQL fallback（保 phase 2 行为）。
         self.structured_retriever = structured_retriever
+        # Phase 5：image_id 非空时走该分支；None 时回退到 Phase 4 路径
+        self.multimodal_branch = multimodal_branch
 
     async def orchestrate(self, req: ChatRequest) -> AsyncIterator[dict]:
         session = self.memory.get_or_create(req.session_id)
         yield {"event": "session", "data": {"session_id": session.id}}
+
+        # Phase 5：image_id 非空 → 走 multimodal 分支。短路其它意图判定。
+        if req.image_id and self.multimodal_branch is not None:
+            async for evt in self._multimodal_orchestrate(req, session):
+                yield evt
+            return
 
         # 0) Phase 4-4：进入新一轮前，看看上一轮 save_turn 后是否需要摘要
         # 触发条件：history ≥ summary_after_turns 轮。await summarizer 同步阻塞，
@@ -361,6 +371,83 @@ class AgentOrchestrator:
         view = dict(view)
         view["reason"] = raw_card.get("reason", "")
         return view
+
+
+    async def _multimodal_orchestrate(self, req: ChatRequest, session) -> AsyncIterator[dict]:
+        """Phase 5 图+文分支：检索由 MultimodalBranch 完成，其余事件流复用现有路径。"""
+        from app.agent.prompts import build_image_search_messages
+
+        yield {"event": "status", "data": {"stage": "parsing"}}
+
+        try:
+            mm_result = await self.multimodal_branch.handle(
+                message=req.message,
+                image_id=req.image_id,
+                history=session.history,
+                summary=session.summary,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("multimodal_branch.handle 异常，emit error + done：%s", exc)
+            yield {"event": "error", "data": {"code": "IMAGE_SEARCH_FAIL", "message": str(exc)[:200]}}
+            yield {"event": "done", "data": {"finish_reason": "error"}}
+            return
+
+        if mm_result.image_lost:
+            yield {"event": "warning", "data": {"code": "IMAGE_LOST", "message": "图片已失效，按文字处理"}}
+
+        retrieved = mm_result.retrieved
+        yield {"event": "status", "data": {"stage": "generating"}}
+        messages = build_image_search_messages(
+            user_message=req.message,
+            image_path="",  # prompt 不消费实际路径
+            retrieved=retrieved,
+            history=session.history,
+            summary=session.summary,
+        )
+
+        allowed_ids = {p.product_id for p in retrieved}
+        extractor = ProductCardExtractor(allowed_ids=allowed_ids)
+        emitted_card_ids: list[str] = []
+        full_visible = ""
+
+        try:
+            async for delta in self.llm.chat_stream(messages):
+                visible, cards = extractor.feed(delta)
+                if visible:
+                    full_visible += visible
+                    yield {"event": "token", "data": {"text": visible}}
+                for card in cards:
+                    hydrated = await self._hydrate_card(card)
+                    if hydrated is None:
+                        continue
+                    emitted_card_ids.append(hydrated["product_id"])
+                    yield {"event": "product_card", "data": hydrated}
+            tail_visible, tail_cards = extractor.finalize()
+            if tail_visible:
+                full_visible += tail_visible
+                yield {"event": "token", "data": {"text": tail_visible}}
+            for card in tail_cards:
+                hydrated = await self._hydrate_card(card)
+                if hydrated is None:
+                    continue
+                emitted_card_ids.append(hydrated["product_id"])
+                yield {"event": "product_card", "data": hydrated}
+        except Exception as exc:
+            logger.exception("LLM 流式异常（图搜分支），走降级链路")
+            code = _classify_error(exc)
+            yield {"event": "error", "data": {"code": code, "message": str(exc)[:200]}}
+            tip = "模型暂不可用，先给你看几款最匹配的商品："
+            yield {"event": "token", "data": {"text": tip}}
+            full_visible += tip
+            for p in retrieved[:_FALLBACK_CARDS]:
+                hydrated = await self._hydrate_card({"product_id": p.product_id, "reason": "图搜 Top-K 兜底"})
+                if hydrated is None:
+                    continue
+                emitted_card_ids.append(hydrated["product_id"])
+                yield {"event": "product_card", "data": hydrated}
+
+        self.memory.save_turn(session.id, req.message, full_visible, emitted_card_ids)
+        yield {"event": "done", "data": {"finish_reason": "stop"}}
 
 
 def _classify_error(exc: BaseException) -> str:

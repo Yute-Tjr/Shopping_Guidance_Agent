@@ -381,3 +381,93 @@ async def test_llm_hallucinated_product_id_dropped():
     assert card_pids == ["p_a"]
     # 仓库也不应被请求 p_fake_999
     assert "p_fake_999" not in repo.lookups
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_routes_to_multimodal_when_image_id_present(monkeypatch):
+    """image_id 非空 → 走 MultimodalBranch；image_id 为空 → 走原 recommend 分支。"""
+    from app.agent.multimodal_branch import MultimodalBranch, MultimodalResult
+    from app.agent.query_rewriter import ParsedQuery
+    from app.rag.retriever import RetrievedProduct
+    from app.schemas.chat import ChatRequest
+
+    called: dict = {"mm": 0, "rec": 0}
+
+    async def fake_handle(self, *, message, image_id, history, summary):
+        called["mm"] += 1
+        return MultimodalResult(
+            query_vector=[0.1] * 4,
+            retrieved=[RetrievedProduct(
+                product_id="p_x", score=0.9, brand="X", category="美妆",
+                sub_category="精华", base_price=100.0,
+                best_chunk_text="", supporting_chunks=[], title="X 商品",
+            )],
+            parsed=ParsedQuery(search_query=message),
+            image_lost=False,
+        )
+
+    monkeypatch.setattr(MultimodalBranch, "handle", fake_handle)
+
+    orch = _make_orchestrator_with_multimodal()
+
+    # image_id 非空 → mm 分支
+    req = ChatRequest(session_id=None, message="找同款", image_id="img-abc")
+    events = [e async for e in orch.orchestrate(req)]
+    assert called["mm"] == 1
+    assert any(e["event"] == "product_card" for e in events) or any(e["event"] == "token" for e in events)
+
+    # image_id 为空 → 不走 mm 分支
+    called["mm"] = 0
+    req2 = ChatRequest(session_id=None, message="推荐手机", image_id=None)
+    events2 = [e async for e in orch.orchestrate(req2)]
+    assert called["mm"] == 0
+
+
+def _make_orchestrator_with_multimodal():
+    """构造一个挂载真实 MultimodalBranch 类实例（handle 由 monkeypatch 替换）+ stub 的 orchestrator。
+
+    注意：必须用真实的 MultimodalBranch 实例，因为测试是通过
+    `monkeypatch.setattr(MultimodalBranch, "handle", ...)` 替换实现的——
+    用 stub 类型会绕过这次替换。
+    """
+    from app.agent.memory import ConversationMemory
+    from app.agent.multimodal_branch import MultimodalBranch
+    from app.agent.orchestrator import AgentOrchestrator
+    from app.rag.retriever import RetrievedProduct
+
+    class _StubLLM:
+        async def chat_stream(self, messages, **kw):
+            yield "推荐 p_x 一款。\n```product_cards\n[{\"product_id\":\"p_x\",\"reason\":\"匹配\"}]\n```"
+
+    class _StubRetriever:
+        def search(self, q, **kw):
+            return [RetrievedProduct(
+                product_id="p_x", score=0.9, brand="X", category="美妆",
+                sub_category="精华", base_price=100.0,
+                best_chunk_text="", supporting_chunks=[], title="X 商品",
+            )]
+
+    class _StubProductRepo:
+        async def get_card_view(self, pid):
+            return {
+                "product_id": pid, "title": "X 商品", "brand": "X",
+                "category": "美妆", "image_url": "/static/x.jpg",
+                "price_range": {"min": 100, "max": 200}, "skus": [],
+            }
+
+    # 真实 MultimodalBranch 实例，深底 stub 全部传 None / 简单 fake
+    mm_branch = MultimodalBranch(
+        embedder=None,   # handle 已被替换不会触达
+        retriever=None,
+        cache=None,
+        query_rewriter=None,
+        structured_retriever=None,
+    )
+
+    return AgentOrchestrator(
+        retriever=_StubRetriever(),
+        llm=_StubLLM(),
+        product_repo=_StubProductRepo(),
+        memory=ConversationMemory(),
+        multimodal_branch=mm_branch,
+    )

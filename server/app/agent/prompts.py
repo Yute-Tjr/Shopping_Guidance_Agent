@@ -155,3 +155,41 @@ def build_compare_messages(
     msgs.extend(_history_messages(history))
     msgs.append({"role": "user", "content": user_message})
     return msgs
+
+
+def build_image_search_messages(
+    *,
+    user_message: str,
+    image_path: str,
+    retrieved: Iterable[RetrievedProduct],
+    history: list[dict] | None,
+    summary: str | None = None,
+) -> list[dict]:
+    """图文检索 prompt（Phase 5）。
+
+    与 build_recommend_messages 的区别：在 _BASE_RULES 上追加图文融合规则。
+
+    设计要点：
+    - image_path 仅用于上游 retrieve 已结束，**不**写进 system prompt——
+      LLM 看到本地路径既无信息量也增加污染面；
+    - 在系统消息里告诉 LLM"用户上传了一张图，检索结果已基于图+文字综合给出，
+      你只需基于 retrieved 推荐；若用户文字与图明显矛盾，以文字为准"。
+    """
+    _ = image_path  # 显式吃掉参数：retrieve 阶段已用，prompt 里不再泄漏
+    image_rules = """\n
+本轮用户上传了一张图（图相似 + 文字约束综合检索后的结果已在 <retrieved_products> 中给出）。
+推荐时请遵守：
+- 优先承接用户的文字诉求（图给出视觉风格 / 类型锚点，文字给出价格/品牌/场景约束）；
+- 若**图文矛盾**（例如用户文字说"不要 X 品牌"但图正好是 X 品牌），**以文字为准**，
+  从 <retrieved_products> 中挑符合文字约束的；
+- 介绍商品时不要主观评价"和你上传的图很像/不像"，因为相似度判断已由检索完成。"""
+
+    system_parts = [_BASE_RULES + image_rules]
+    summary_block = _format_summary_block(summary)
+    if summary_block:
+        system_parts.extend(["", summary_block])
+    system_parts.extend(["", _format_retrieved_block(retrieved)])
+    msgs: list[dict] = [{"role": "system", "content": "\n".join(system_parts)}]
+    msgs.extend(_history_messages(history))
+    msgs.append({"role": "user", "content": user_message})
+    return msgs
