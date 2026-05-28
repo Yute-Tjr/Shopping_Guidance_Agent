@@ -361,6 +361,53 @@ async def test_compare_intent_runs_per_target_retrieval():
 
 
 @pytest.mark.asyncio
+async def test_compare_followup_uses_last_recommended_ids_without_llm_target_parse():
+    """“对比这两款产品”应直接承接上一轮卡片 ID，避免卡在额外 LLM JSON 解析。"""
+    mem = ConversationMemory()
+    session = mem.get_or_create(None)
+    mem.save_turn(
+        session.id,
+        "推荐蓝牙耳机",
+        "为你推荐华为和 Apple 两款。",
+        ["p_huawei", "p_apple"],
+    )
+    retr = _FakeRetriever([_product("p_huawei"), _product("p_apple")])
+    repo = _FakeProductRepo()
+    extractor = _FakeCompareExtractor(targets=["不应该调用"])
+    llm_tokens = [
+        "| 对比维度 | 华为耳机 | Apple 耳机 |\n",
+        "| --- | --- | --- |\n",
+        "| 价格区间 | ￥79-129 | ￥79-129 |\n\n",
+        "华为更适合预算优先。\n",
+        "```product_cards\n",
+        '[{"product_id":"p_huawei","reason":"预算友好"},'
+        '{"product_id":"p_apple","reason":"生态体验好"}]\n',
+        "```",
+    ]
+    orch = AgentOrchestrator(
+        retriever=retr,
+        llm=_FakeLLM(llm_tokens),
+        product_repo=repo,
+        memory=mem,
+        compare_extractor=extractor,
+    )
+
+    events = [
+        e async for e in orch.orchestrate(
+            ChatRequest(session_id=session.id, message="对比这两款产品")
+        )
+    ]
+
+    assert extractor.calls == 0
+    assert retr.calls[:2] == ["p_huawei", "p_apple"]
+    assert [e["data"]["product_id"] for e in events if e["event"] == "product_card"] == [
+        "p_huawei",
+        "p_apple",
+    ]
+    assert events[-1]["event"] == "done"
+
+
+@pytest.mark.asyncio
 async def test_llm_hallucinated_product_id_dropped():
     """LLM 卡片输出了不在检索结果里的 product_id，必须被丢弃。"""
     retr = _FakeRetriever([_product("p_a")])

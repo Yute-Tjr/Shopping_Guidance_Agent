@@ -32,6 +32,7 @@ struct ChatView: View {
     /// 节流 scrollTo：流式 token 一秒可能 30 个，把 80ms 窗口内的多次合并成一次，
     /// 同时去掉 withAnimation —— 0.18s 动画排队叠加用户手势是主线程死锁的主因。
     @State private var scrollKickTask: Task<Void, Never>? = nil
+    @State private var productNavigation = ProductNavigationSelection()
 
     init(env: AppEnvironment) {
         let api = APIClient(baseURL: env.baseURL)
@@ -56,6 +57,9 @@ struct ChatView: View {
             }
         }
         .navigationBarHidden(true)
+        .navigationDestination(item: $productNavigation.destination) { destination in
+            ProductDetailView(productID: destination.productID)
+        }
         // pickedImage 清空后，必须同步把 PhotosPicker 的 selection 也清掉。
         // 否则 send()/resetSession() 只清了 pickedImage，photosPickerItem 还残留旧 asset id；
         // 用户再选同一张图时新 PhotosPickerItem == 旧值，.onChange 不触发，图加载不进来。
@@ -153,10 +157,16 @@ struct ChatView: View {
                         .listRowInsets(EdgeInsets())
                 }
                 ForEach(viewModel.messages) { msg in
-                    MessageBubble(message: msg) { option in
-                        viewModel.inputText = option
-                        Task { await viewModel.send() }
-                    }
+                    MessageBubble(
+                        message: msg,
+                        onSelectClarify: { option in
+                            viewModel.inputText = option
+                            Task { await viewModel.send() }
+                        },
+                        onSelectProduct: { card in
+                            productNavigation.select(productID: card.productId)
+                        }
+                    )
                     .equatable()
                     // 上下各 Spacing.s (8) → 相邻两行合计 16 = 原 LazyVStack(spacing: l) 视觉
                     .padding(.horizontal, Theme.Spacing.l)

@@ -167,6 +167,9 @@ class AgentOrchestrator:
                 filter_expr=filter_expr,
                 history=session.history,
                 summary=session.summary,
+                recent_product_ids=_recent_compare_targets(
+                    req.message, session.last_recommended_ids,
+                ),
             )
         else:
             retrieved = await self._recommend_retrieve(
@@ -286,6 +289,7 @@ class AgentOrchestrator:
         filter_expr: str | None,
         history: list[dict] | None = None,
         summary: str | None = None,
+        recent_product_ids: list[str] | None = None,
     ) -> list[RetrievedProduct]:
         """compare 分支专用：每个 target 各 Top-2，合并去重最多 3 件塞 prompt。
 
@@ -296,25 +300,32 @@ class AgentOrchestrator:
         target 是 product_id（如"p_beauty_011"）时也能正常 retrieve——retriever
         对 product_id 做 embedding 仍能召回到自身（Phase 1 sanity 已验证）。
         """
+        direct_id_targets = list(recent_product_ids or [])
+        if direct_id_targets:
+            targets = direct_id_targets[:3]
+            logger.info("compare 承接上一轮推荐 product_id targets=%s", targets)
+        else:
+            targets = []
+
         # 没接 extractor 直接走整句
-        if self.compare_extractor is None:
+        if not targets and self.compare_extractor is None:
             retrieved = self.retriever.search(rewritten, filter_expr=filter_expr)
             if not retrieved and filter_expr:
                 retrieved = self.retriever.search(rewritten)
             return retrieved
 
-        try:
-            plan = await self.compare_extractor.plan(
-                original_query, history=history, summary=summary,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("compare 拆 target 异常，整句兜底：%s", exc)
-            plan = None
+        if not targets:
+            try:
+                plan = await self.compare_extractor.plan(
+                    original_query, history=history, summary=summary,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("compare 拆 target 异常，整句兜底：%s", exc)
+                plan = None
 
-        targets: list[str] = []
-        if plan is not None and len(plan.targets) >= 2:
-            targets = plan.targets[:3]
-            logger.info("compare targets=%s", targets)
+            if plan is not None and len(plan.targets) >= 2:
+                targets = plan.targets[:3]
+                logger.info("compare targets=%s", targets)
         if not targets:
             retrieved = self.retriever.search(rewritten, filter_expr=filter_expr)
             if not retrieved and filter_expr:
@@ -323,8 +334,14 @@ class AgentOrchestrator:
 
         # 对每个 target 各 retrieve，按命中顺序保留首次出现的 product
         merged: dict[str, RetrievedProduct] = {}
+        direct_id_set = set(direct_id_targets)
         for tgt in targets:
             hits = self.retriever.search(tgt, top_n_products=2, filter_expr=filter_expr)
+            if tgt in direct_id_set:
+                exact = next((p for p in hits if p.product_id == tgt), None)
+                if exact is not None:
+                    merged.setdefault(exact.product_id, exact)
+                    continue
             for p in hits:
                 merged.setdefault(p.product_id, p)
         # 合起来不足 2 件时去掉 filter 重试
@@ -458,3 +475,22 @@ def _classify_error(exc: BaseException) -> str:
     if "rate" in name or "429" in str(exc):
         return "LLM_RATE_LIMIT"
     return "LLM_ERROR"
+
+
+_RECENT_COMPARE_REFERENCE_HINTS: tuple[str, ...] = (
+    "这两款", "这两个", "这几款", "这几个", "这两件",
+    "两款产品", "两个产品", "两款商品", "两个商品",
+    "上面两款", "上面这两款", "上面两个", "前面两款",
+    "刚才推荐", "刚刚推荐", "你推荐的", "你说的那",
+    "刚才那", "刚刚那", "之前推荐", "之前的那",
+)
+
+
+def _recent_compare_targets(message: str, last_recommended_ids: list[str]) -> list[str]:
+    """对“对比这两款产品”这类承接句，直接复用上一轮卡片 ID。"""
+    if len(last_recommended_ids) < 2:
+        return []
+    text = (message or "").strip()
+    if not any(hint in text for hint in _RECENT_COMPARE_REFERENCE_HINTS):
+        return []
+    return list(dict.fromkeys(last_recommended_ids))[:3]

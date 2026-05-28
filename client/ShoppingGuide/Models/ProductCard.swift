@@ -69,3 +69,28 @@ public struct ProductCard: Identifiable, Codable, Equatable, Sendable {
         case reason
     }
 }
+
+public struct ProductNavigationDestination: Identifiable, Hashable, Sendable {
+    public var id: String { productID }
+    public let productID: String
+
+    public init(productID: String) {
+        self.productID = productID
+    }
+}
+
+public struct ProductNavigationSelection: Equatable, Sendable {
+    public var destination: ProductNavigationDestination?
+
+    public init(destination: ProductNavigationDestination? = nil) {
+        self.destination = destination
+    }
+
+    public mutating func select(productID: String) {
+        destination = ProductNavigationDestination(productID: productID)
+    }
+
+    public mutating func clear() {
+        destination = nil
+    }
+}

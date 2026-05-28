@@ -34,6 +34,8 @@ public final class ChatViewModel: ObservableObject {
     private var pendingTokenBuffer: String = ""
     private var pendingFlushTask: Task<Void, Never>? = nil
     private static let tokenFlushIntervalNs: UInt64 = 100_000_000  // 100ms
+    private var activeSendTask: Task<Void, Never>?
+    private var activeTurnID = UUID()
 
     public init(
         transport: ChatTransport,
@@ -51,6 +53,8 @@ public final class ChatViewModel: ObservableObject {
         let picked = pickedImage
         guard !text.isEmpty || picked != nil else { return }
         guard !isSending else { return }
+        let turnID = UUID()
+        activeTurnID = turnID
 
         // 用户气泡：保留本地缩略图 URL，气泡渲染时直接显示
         let userMsg = ChatMessage(
@@ -59,7 +63,7 @@ public final class ChatViewModel: ObservableObject {
             localImageURL: picked?.localURL,
         )
         messages.append(userMsg)
-        var assistant = ChatMessage(role: .assistant, isStreaming: true)
+        let assistant = ChatMessage(role: .assistant, isStreaming: true)
         messages.append(assistant)
         let assistantIndex = messages.count - 1
 
@@ -67,12 +71,35 @@ public final class ChatViewModel: ObservableObject {
         pickedImage = nil
         isSending = true
         uploadNotice = nil
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runSend(
+                text: text,
+                picked: picked,
+                assistantIndex: assistantIndex,
+                turnID: turnID
+            )
+        }
+        activeSendTask = task
+        await task.value
+    }
+
+    private func runSend(
+        text: String,
+        picked: PickedImage?,
+        assistantIndex: Int,
+        turnID: UUID
+    ) async {
         defer {
-            // 兜底：循环里没拿到 .done 时也要清流式状态
-            if assistantIndex < messages.count {
-                messages[assistantIndex].isStreaming = false
+            // 兜底：循环里没拿到 .done 时也要清流式状态；旧轮次已被 reset 失效时不再写 UI。
+            if isActiveTurn(turnID) {
+                if assistantIndex < messages.count {
+                    messages[assistantIndex].isStreaming = false
+                }
+                isSending = false
+                activeSendTask = nil
             }
-            isSending = false
         }
 
         // Phase 5：先上传图（如有），换 image_id；失败按降级策略分支处理
@@ -80,10 +107,13 @@ public final class ChatViewModel: ObservableObject {
         if let picked, let upload = uploadService {
             do {
                 imageID = try await upload.upload(image: picked.data)
+                guard isActiveTurn(turnID) else { return }
             } catch let UploadError.degraded(message) {
+                guard isActiveTurn(turnID) else { return }
                 // 503：vision API 繁忙——保留用户消息（含缩略图），但下面继续发纯文本流
                 uploadNotice = "\(message)（已按文字继续）"
             } catch {
+                guard isActiveTurn(turnID), assistantIndex < messages.count else { return }
                 // 其它错误：把错误挂到 assistant 气泡，停止本轮
                 messages[assistantIndex].errorNotice = "图片上传失败：\(error.localizedDescription)"
                 messages[assistantIndex].isStreaming = false
@@ -96,6 +126,7 @@ public final class ChatViewModel: ObservableObject {
         for await event in transport.stream(
             message: messageToSend, sessionID: sessionID, imageID: imageID,
         ) {
+            guard isActiveTurn(turnID), assistantIndex < messages.count else { break }
             switch event {
             case .session(let id):
                 sessionID = id
@@ -103,13 +134,13 @@ public final class ChatViewModel: ObservableObject {
                 break
             case .token(let chunk):
                 pendingTokenBuffer += chunk
-                scheduleTokenFlush(into: assistantIndex)
+                scheduleTokenFlush(into: assistantIndex, turnID: turnID)
             case .productCard(let card):
                 // 商品卡件数变化也是高成本 layout，先 flush pending text 一起 publish
-                flushPendingTokens(into: assistantIndex)
+                flushPendingTokens(into: assistantIndex, turnID: turnID)
                 messages[assistantIndex].productCards.append(card)
             case .clarify(let payload):
-                flushPendingTokens(into: assistantIndex)
+                flushPendingTokens(into: assistantIndex, turnID: turnID)
                 messages[assistantIndex].clarify = payload
             case .error(let code, let message):
                 // 错误不替换正文，仅在气泡末尾挂一条提示
@@ -121,18 +152,18 @@ public final class ChatViewModel: ObservableObject {
                 }
             case .done:
                 // 流式结束：必须把残余 buffer flush 完再翻 isStreaming，否则末尾几个 token 会丢
-                flushPendingTokens(into: assistantIndex)
+                flushPendingTokens(into: assistantIndex, turnID: turnID)
                 messages[assistantIndex].isStreaming = false
             }
-            _ = assistant   // 抑制未使用警告
         }
         // 兜底：upstream 流意外中断（未发 .done）时也把 buffer 排空
-        flushPendingTokens(into: assistantIndex)
+        flushPendingTokens(into: assistantIndex, turnID: turnID)
     }
 
     /// 把累积的 token buffer 一次性追到 messages[idx].text，并清空。
     /// 同时取消任何 pending 的延迟 flush —— 同步 flush 后没必要再异步触发一次。
-    private func flushPendingTokens(into idx: Int) {
+    private func flushPendingTokens(into idx: Int, turnID: UUID) {
+        guard isActiveTurn(turnID) else { return }
         pendingFlushTask?.cancel()
         pendingFlushTask = nil
         guard !pendingTokenBuffer.isEmpty, idx < messages.count else {
@@ -145,20 +176,33 @@ public final class ChatViewModel: ObservableObject {
 
     /// 调度一次延迟 flush。100ms 内多个 token 落到同一个 buffer，到点合并 publish 一次。
     /// 已有 pending task 时不重复调度——让它正常到点，下次 token 会续到 buffer。
-    private func scheduleTokenFlush(into idx: Int) {
+    private func scheduleTokenFlush(into idx: Int, turnID: UUID) {
+        guard isActiveTurn(turnID) else { return }
         if pendingFlushTask != nil { return }
         pendingFlushTask = Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: Self.tokenFlushIntervalNs)
             guard let self, !Task.isCancelled else { return }
             self.pendingFlushTask = nil
-            self.flushPendingTokens(into: idx)
+            self.flushPendingTokens(into: idx, turnID: turnID)
         }
     }
 
-    /// 新建会话：清空消息 + sessionID + 取消未发送的图。
+    private func isActiveTurn(_ turnID: UUID) -> Bool {
+        activeTurnID == turnID && !Task.isCancelled
+    }
+
+    /// 新建会话：停止当前流、清空消息 / 输入 / sessionID，并立即解锁输入栏。
     public func resetSession() {
+        activeSendTask?.cancel()
+        activeSendTask = nil
+        activeTurnID = UUID()
+        pendingFlushTask?.cancel()
+        pendingFlushTask = nil
+        pendingTokenBuffer.removeAll(keepingCapacity: true)
         messages.removeAll()
+        inputText = ""
         sessionID = nil
+        isSending = false
         pickedImage = nil
         uploadNotice = nil
     }

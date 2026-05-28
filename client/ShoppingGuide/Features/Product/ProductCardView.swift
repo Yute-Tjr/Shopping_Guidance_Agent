@@ -16,16 +16,22 @@ import SwiftUI
 ///     └─────────────────────────────────────────────────────┘
 ///
 /// 行为：
-/// - 整张卡片包 `NavigationLink` → push `ProductDetailView`。
+/// - 整张卡片是 Button，把选择交给聊天页统一导航。
 /// - 主图走 `AsyncImage`，加载时浅橙占位（与背景一致，过渡更顺）。
 /// - 价格逻辑：min == max 时只显示一个；不同则 min 大字红色 / max 划线灰。
 ///   "省 ¥xx" 用 max - min 算出，差为 0 时不渲染 badge。
 struct ProductCardView: View {
     let card: ProductCard
+    let onSelect: (ProductCard) -> Void
+
+    init(card: ProductCard, onSelect: @escaping (ProductCard) -> Void = { _ in }) {
+        self.card = card
+        self.onSelect = onSelect
+    }
 
     var body: some View {
-        NavigationLink {
-            ProductDetailView(productID: card.productId)
+        Button {
+            onSelect(card)
         } label: {
             HStack(alignment: .top, spacing: Theme.Spacing.m) {
                 imageBlock

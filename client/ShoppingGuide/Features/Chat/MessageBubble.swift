@@ -15,6 +15,7 @@ import SwiftUI
 struct MessageBubble: View, Equatable {
     let message: ChatMessage
     var onSelectClarify: ((String) -> Void)? = nil
+    var onSelectProduct: ((ProductCard) -> Void)? = nil
 
     /// 配合 ChatView 调用处的 .equatable() 使用：父 view 因流式 token 推动反复重评估 body 时，
     /// SwiftUI 会重新 init 每一条 MessageBubble；不加 == 跳过的话每条历史消息每帧都重跑
@@ -225,7 +226,9 @@ struct MessageBubble: View, Equatable {
     private var cardsStack: some View {
         VStack(spacing: Theme.Spacing.m) {
             ForEach(message.productCards) { card in
-                ProductCardView(card: card)
+                ProductCardView(card: card) { selected in
+                    onSelectProduct?(selected)
+                }
             }
         }
     }

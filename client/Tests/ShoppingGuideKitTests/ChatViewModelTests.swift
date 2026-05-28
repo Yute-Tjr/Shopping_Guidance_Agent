@@ -15,6 +15,37 @@ struct FakeChatTransport: ChatTransport {
     }
 }
 
+final class ControlledChatTransport: ChatTransport, @unchecked Sendable {
+    private var continuations: [AsyncStream<SSEEvent>.Continuation] = []
+    private var streamCountContinuations: [(count: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    func stream(message: String, sessionID: String?, imageID: String?) -> AsyncStream<SSEEvent> {
+        AsyncStream { continuation in
+            continuations.append(continuation)
+            let waiting = streamCountContinuations.filter { continuations.count >= $0.count }
+            streamCountContinuations.removeAll { continuations.count >= $0.count }
+            for waiter in waiting {
+                waiter.continuation.resume()
+            }
+        }
+    }
+
+    func waitForStreamCount(_ count: Int) async {
+        if continuations.count >= count { return }
+        await withCheckedContinuation { continuation in
+            streamCountContinuations.append((count, continuation))
+        }
+    }
+
+    func yield(_ event: SSEEvent, to index: Int = 0) {
+        continuations[index].yield(event)
+    }
+
+    func finish(_ index: Int = 0) {
+        continuations[index].finish()
+    }
+}
+
 private func sampleCard(_ pid: String = "p_test") -> ProductCard {
     ProductCard(
         productId: pid,
@@ -139,6 +170,44 @@ struct ChatViewModelTests {
         vm.resetSession()
         #expect(vm.messages.isEmpty)
         #expect(vm.sessionID == nil)
+    }
+
+    @Test func resetSessionDuringStreamingCancelsOldTurnAndUnlocksInput() async {
+        let transport = ControlledChatTransport()
+        let vm = ChatViewModel(transport: transport, initialSessionID: "sess-old")
+        vm.inputText = "推荐蓝牙耳机"
+
+        let firstSend = Task { await vm.send() }
+        await transport.waitForStreamCount(1)
+        #expect(vm.isSending == true)
+
+        vm.inputText = "未发送的新会话草稿"
+        vm.resetSession()
+
+        #expect(vm.messages.isEmpty)
+        #expect(vm.sessionID == nil)
+        #expect(vm.inputText == "")
+        #expect(vm.isSending == false)
+
+        transport.yield(.token(text: "旧回复不应出现"))
+        transport.yield(.productCard(sampleCard("p_old")))
+        transport.yield(.done)
+        await firstSend.value
+
+        #expect(vm.messages.isEmpty)
+        #expect(vm.isSending == false)
+
+        vm.inputText = "新会话可以发送"
+        let secondSend = Task { await vm.send() }
+        await transport.waitForStreamCount(2)
+        transport.yield(.token(text: "新回复"), to: 1)
+        transport.yield(.done, to: 1)
+        await secondSend.value
+
+        #expect(vm.messages.count == 2)
+        #expect(vm.messages[0].text == "新会话可以发送")
+        #expect(vm.messages[1].text == "新回复")
+        #expect(vm.messages[1].isStreaming == false)
     }
 
     @Test func sessionIDPersistsAcrossTurns() async {
