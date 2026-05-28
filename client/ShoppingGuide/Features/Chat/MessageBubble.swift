@@ -12,9 +12,17 @@ import SwiftUI
 /// - Assistant 气泡：白底 + 浅边框，左对齐。
 /// - 流式时末尾接一个微动的圆点光标（不是字符 `▍`，避免视觉抖动）。
 /// - 商品卡片与 clarify chips 不嵌进气泡，独立排列在气泡下方。
-struct MessageBubble: View {
+struct MessageBubble: View, Equatable {
     let message: ChatMessage
     var onSelectClarify: ((String) -> Void)? = nil
+
+    /// 配合 ChatView 调用处的 .equatable() 使用：父 view 因流式 token 推动反复重评估 body 时，
+    /// SwiftUI 会重新 init 每一条 MessageBubble；不加 == 跳过的话每条历史消息每帧都重跑
+    /// MarkdownParser.parse(整段)，几轮长对话就让主线程死锁。closure 字段不参与比较——
+    /// 每次父 view 重建 closure 都是新实例，会让等式恒 false 失去优化效果。
+    static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
+        lhs.message == rhs.message
+    }
 
     var body: some View {
         VStack(alignment: message.role == .user ? .trailing : .leading,
@@ -43,24 +51,54 @@ struct MessageBubble: View {
     @ViewBuilder
     private var assistantContent: some View {
         let trimmed = message.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        let blocks = MarkdownParser.parse(trimmed)
-        let segments = Self.segregate(blocks: blocks)
 
-        VStack(alignment: .leading, spacing: Theme.Spacing.s) {
-            ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
-                switch seg {
-                case .paragraphs(let attrs):
-                    // 同一组连续段落塞进同一个气泡，气泡 hug 内容，min 宽=不限
-                    assistantBubble(paragraphs: attrs)
-                case .table(let headers, let rows):
-                    // 表格占消息列全宽 —— 突破气泡的右侧 spacer，让内容能展开
-                    TableBlockView(headers: headers, rows: rows)
+        // 流式期间避开 MarkdownParser.parse —— 每个 token 全量重解析整段是 O(n²) 主线程开销，
+        // 是模拟器 100% CPU 卡死的主因之一。等到 done 事件 (isStreaming=false) 才一次性解析。
+        if message.isStreaming {
+            assistantStreamingBubble(text: trimmed)
+        } else {
+            let blocks = MarkdownParser.parse(trimmed)
+            let segments = Self.segregate(blocks: blocks)
+            VStack(alignment: .leading, spacing: Theme.Spacing.s) {
+                ForEach(Array(segments.enumerated()), id: \.offset) { _, seg in
+                    switch seg {
+                    case .paragraphs(let attrs):
+                        // 同一组连续段落塞进同一个气泡，气泡 hug 内容，min 宽=不限
+                        assistantBubble(paragraphs: attrs)
+                    case .table(let headers, let rows):
+                        // 表格占消息列全宽 —— 突破气泡的右侧 spacer，让内容能展开
+                        TableBlockView(headers: headers, rows: rows)
+                    }
                 }
             }
-            // 流式光标 = 没有段落或最后一块不是段落时，独立放一个
-            if message.isStreaming && !endsWithBubble(segments) {
+        }
+    }
+
+    /// 流式期间的轻量气泡：纯 Text 拼接（O(n)），不跑 markdown 解析，不分段，不建子 view 树。
+    /// 视觉上和 assistantBubble 保持一致；流式结束后会被 assistantContent 的 markdown 分支替换。
+    private func assistantStreamingBubble(text: String) -> some View {
+        HStack(alignment: .top, spacing: 0) {
+            VStack(alignment: .leading, spacing: 8) {
+                if !text.isEmpty {
+                    Text(text)
+                        .font(Theme.Typo.body())
+                        .foregroundStyle(Theme.Palette.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 StreamingDot(color: Theme.Palette.brand)
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(
+                RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
+                    .fill(Theme.Palette.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Theme.Radius.bubble, style: .continuous)
+                    .stroke(Theme.Palette.border, lineWidth: 1)
+            )
+            .themeShadow(Theme.Shadow.card)
+            Spacer(minLength: Theme.Spacing.xl)
         }
     }
 

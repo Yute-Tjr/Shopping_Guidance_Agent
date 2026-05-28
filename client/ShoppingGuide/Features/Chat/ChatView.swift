@@ -26,6 +26,13 @@ struct ChatView: View {
 
     @State private var photosPickerItem: PhotosPickerItem? = nil
 
+    /// 流式期间用户是否手动滚动过：拖动一旦发生就翻 true，停止追着 token 把视图拉回底部；
+    /// 用户发新消息时（messages.count 增加）重置为 false 并强制粘底。
+    @State private var userScrolledAwayDuringStream: Bool = false
+    /// 节流 scrollTo：流式 token 一秒可能 30 个，把 80ms 窗口内的多次合并成一次，
+    /// 同时去掉 withAnimation —— 0.18s 动画排队叠加用户手势是主线程死锁的主因。
+    @State private var scrollKickTask: Task<Void, Never>? = nil
+
     init(env: AppEnvironment) {
         let api = APIClient(baseURL: env.baseURL)
         let transport = LiveChatTransport(api: api)
@@ -49,6 +56,14 @@ struct ChatView: View {
             }
         }
         .navigationBarHidden(true)
+        // pickedImage 清空后，必须同步把 PhotosPicker 的 selection 也清掉。
+        // 否则 send()/resetSession() 只清了 pickedImage，photosPickerItem 还残留旧 asset id；
+        // 用户再选同一张图时新 PhotosPickerItem == 旧值，.onChange 不触发，图加载不进来。
+        .onChange(of: viewModel.pickedImage) { _, newValue in
+            if newValue == nil {
+                photosPickerItem = nil
+            }
+        }
         .task {
             #if DEBUG
             // E2E smoke 钩子：simctl 启动时若传 -autoSendDemo "<query>"，自动发一次。
@@ -123,30 +138,48 @@ struct ChatView: View {
 
     private var messageList: some View {
         ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: Theme.Spacing.l) {
-                    if viewModel.messages.isEmpty {
-                        emptyState
-                            .padding(.top, 40)
-                            .id(Self.emptyStateAnchorID)
-                    }
-                    ForEach(viewModel.messages) { msg in
-                        MessageBubble(message: msg) { option in
-                            viewModel.inputText = option
-                            Task { await viewModel.send() }
-                        }
-                        .id(msg.id)
-                    }
+            // 用 List 而非 ScrollView+LazyVStack：后者在滑动时 SwiftUI 每帧都跑
+            // ScrollViewLayoutComputer.sizeThatFits 全量重测 content，trace 测得占主线程 64%
+            // → 流式 token 推内容时叠加滑动手势 = 100% CPU 卡死。
+            // List 走 UITableView 后端，cell 独立缓存高度，滑动时只测可见 cell。
+            List {
+                if viewModel.messages.isEmpty {
+                    emptyState
+                        .padding(.top, 40)
+                        .padding(.horizontal, Theme.Spacing.l)
+                        .id(Self.emptyStateAnchorID)
+                        .listRowSeparator(.hidden)
+                        .listRowBackground(Color.clear)
+                        .listRowInsets(EdgeInsets())
                 }
-                .padding(.horizontal, Theme.Spacing.l)
-                .padding(.vertical, Theme.Spacing.m)
+                ForEach(viewModel.messages) { msg in
+                    MessageBubble(message: msg) { option in
+                        viewModel.inputText = option
+                        Task { await viewModel.send() }
+                    }
+                    .equatable()
+                    // 上下各 Spacing.s (8) → 相邻两行合计 16 = 原 LazyVStack(spacing: l) 视觉
+                    .padding(.horizontal, Theme.Spacing.l)
+                    .padding(.vertical, Theme.Spacing.s)
+                    .id(msg.id)
+                    .listRowSeparator(.hidden)
+                    .listRowBackground(Color.clear)
+                    .listRowInsets(EdgeInsets())
+                }
             }
-            .onChange(of: viewModel.messages.last?.text) { _, _ in
-                if let last = viewModel.messages.last {
-                    withAnimation(.easeOut(duration: 0.18)) {
-                        proxy.scrollTo(last.id, anchor: .bottom)
+            .listStyle(.plain)
+            .scrollContentBackground(.hidden)   // 隐藏 List 自带的浅灰背景，让 Theme.canvas 透出
+            // 用户在流式期间一旦手动拖动，就停止 auto-scroll，让用户能安心向上看历史。
+            // minimumDistance: 10 避免和点击/无关手势冲突；simultaneous 不抢 List 自身滚动。
+            .simultaneousGesture(
+                DragGesture(minimumDistance: 10).onChanged { _ in
+                    if viewModel.isSending {
+                        userScrolledAwayDuringStream = true
                     }
                 }
+            )
+            .onChange(of: viewModel.messages.last?.text) { _, _ in
+                scheduleScrollToBottom(proxy: proxy)
             }
             .onChange(of: viewModel.messages.count) { oldCount, newCount in
                 // 新建会话：count 从 >0 变 0 → 把 ScrollView 滚回 emptyState 顶部
@@ -156,10 +189,29 @@ struct ChatView: View {
                     }
                     return
                 }
-                if let last = viewModel.messages.last {
-                    proxy.scrollTo(last.id, anchor: .bottom)
+                // 用户发新消息：重置追随状态并立刻粘底（不走节流，让发送瞬间感觉跟手）
+                if newCount > oldCount {
+                    userScrolledAwayDuringStream = false
+                    scrollKickTask?.cancel()
+                    if let last = viewModel.messages.last {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
                 }
             }
+        }
+    }
+
+    /// 把同一帧内多个 token 的 scrollTo 合并成一次（80ms 节流），
+    /// 并去掉 withAnimation 避免动画堆栈。用户主动滑离时直接放弃本次。
+    private func scheduleScrollToBottom(proxy: ScrollViewProxy) {
+        guard !userScrolledAwayDuringStream else { return }
+        scrollKickTask?.cancel()
+        scrollKickTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 80_000_000)
+            guard !Task.isCancelled,
+                  !userScrolledAwayDuringStream,
+                  let last = viewModel.messages.last else { return }
+            proxy.scrollTo(last.id, anchor: .bottom)
         }
     }
 
