@@ -8,7 +8,7 @@ from typing import Any
 
 import pytest
 
-from app.agent.multimodal_branch import MultimodalBranch
+from app.agent.multimodal_branch import MultimodalBranch, rerank_multimodal_products
 from app.agent.query_rewriter import ParsedQuery
 from app.rag.retriever import RetrievedProduct
 
@@ -59,6 +59,26 @@ def _mk_hit(pid: str, score: float = 0.9, chunk_type: str = "image", brand: str 
             "source_id": f"{pid}#{chunk_type}#0",
         },
     }
+
+
+def _mk_product(
+    pid: str,
+    *,
+    score: float,
+    brand: str,
+    sub_category: str,
+    base_price: float,
+) -> RetrievedProduct:
+    return RetrievedProduct(
+        product_id=pid,
+        score=score,
+        brand=brand,
+        category="数码电子",
+        sub_category=sub_category,
+        base_price=base_price,
+        min_sku_price=base_price,
+        max_sku_price=base_price,
+    )
 
 
 class _StubStore:
@@ -150,7 +170,11 @@ async def test_branch_combines_structural_filter_with_chunk_type():
     cache = _StubCache({"x": ([0.0] * 4, "/tmp/x.jpg")})
     embedder = _StubEmbedder()
     parsed = ParsedQuery(
-        search_query="同款", price_max=1000.0, brands_exclude=["耐克"],
+        search_query="同款",
+        price_max=1000.0,
+        categories=["服饰运动"],
+        sub_categories=["跑步鞋"],
+        brands_exclude=["耐克"],
     )
     rewriter = _StubRewriter(parsed)
     retriever = _StubRetriever([_mk_hit("p_a")])
@@ -167,6 +191,7 @@ async def test_branch_combines_structural_filter_with_chunk_type():
     fexpr = retriever.search_calls[0]["filter_expr"]
     # 同时包含价格 + brand_exclude + chunk_type
     assert "1000" in fexpr  # price_max
+    assert 'sub_category in ["跑步鞋"]' in fexpr
     assert "耐克" in fexpr
     assert "chunk_type" in fexpr
 
@@ -197,3 +222,28 @@ async def test_branch_falls_back_to_text_only_when_image_missing_on_disk():
 
     assert result.image_lost is True
     assert len(result.retrieved) == 1
+
+
+def test_rerank_promotes_same_tier_candidate_for_brand_exclude():
+    parsed = ParsedQuery(
+        search_query="手机",
+        sub_categories=["智能手机"],
+        brands_exclude=["Apple 苹果", "苹果"],
+    )
+    source = _mk_product(
+        "p_digital_001",
+        score=0.99,
+        brand="Apple 苹果",
+        sub_category="智能手机",
+        base_price=8999,
+    )
+    products = [
+        _mk_product("p_digital_009", score=0.95, brand="小米", sub_category="智能手机", base_price=6499),
+        _mk_product("p_digital_014", score=0.94, brand="OPPO", sub_category="智能手机", base_price=9699),
+        _mk_product("p_digital_002", score=0.93, brand="华为", sub_category="智能手机", base_price=6999),
+        _mk_product("p_digital_008", score=0.90, brand="小米", sub_category="智能手机", base_price=7499),
+    ]
+
+    ranked = rerank_multimodal_products(products, parsed=parsed, source_hint=source)
+
+    assert "p_digital_008" in [p.product_id for p in ranked[:3]]

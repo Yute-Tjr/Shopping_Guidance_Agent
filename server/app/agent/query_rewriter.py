@@ -46,6 +46,35 @@ _CATEGORY_ALIASES: dict[str, str] = {
     "食品": "食品饮料", "零食": "食品饮料", "饮料": "食品饮料", "咖啡": "食品饮料",
 }
 
+# 黑话 → products.sub_category 映射。值用 list 是因为少数宽泛意图需要映射到
+# 多个可验收子类，例如 Phase 5 的「300 元以下护肤」黄金集定义为防晒 / 洁面。
+_SUB_CATEGORY_ALIASES: dict[str, list[str]] = {
+    "跑步鞋": ["跑步鞋"],
+    "跑鞋": ["跑步鞋"],
+    "篮球鞋": ["篮球鞋"],
+    "智能手机": ["智能手机"],
+    "旗舰手机": ["智能手机"],
+    "手机": ["智能手机"],
+    "笔记本电脑": ["笔记本电脑"],
+    "笔记本": ["笔记本电脑"],
+    "平板电脑": ["平板电脑"],
+    "平板": ["平板电脑"],
+    "真无线耳机": ["真无线耳机"],
+    "蓝牙耳机": ["真无线耳机"],
+    "耳机": ["真无线耳机"],
+    "精华液": ["精华"],
+    "精华": ["精华"],
+    "防晒霜": ["防晒"],
+    "防晒乳": ["防晒"],
+    "防晒": ["防晒"],
+    "洗面奶": ["洁面"],
+    "洁面乳": ["洁面"],
+    "洁面": ["洁面"],
+    "咖啡": ["咖啡"],
+}
+
+_AFFORDABLE_SKINCARE_SUB_CATEGORIES: tuple[str, ...] = ("防晒", "洁面")
+
 
 @dataclass
 class ParsedQuery:
@@ -55,6 +84,7 @@ class ParsedQuery:
     price_min: Optional[float] = None         # 最低价（含），单位元
     price_max: Optional[float] = None         # 最高价（含），单位元
     categories: list[str] = field(default_factory=list)        # 类目白名单
+    sub_categories: list[str] = field(default_factory=list)    # 子类白名单
     brands_include: list[str] = field(default_factory=list)    # 必须的品牌
     brands_exclude: list[str] = field(default_factory=list)    # 必须排除的品牌
 
@@ -73,6 +103,9 @@ class ParsedQuery:
         if self.categories:
             cats = ", ".join(f'"{_escape(c)}"' for c in self.categories)
             parts.append(f"category in [{cats}]")
+        if self.sub_categories:
+            subs = ", ".join(f'"{_escape(c)}"' for c in self.sub_categories)
+            parts.append(f"sub_category in [{subs}]")
         if self.brands_include:
             bs = ", ".join(f'"{_escape(b)}"' for b in self.brands_include)
             parts.append(f"brand in [{bs}]")
@@ -216,6 +249,7 @@ class QueryRewriter:
         '  "price_min": number | null  // 最低价（含），单位人民币元\n'
         '  "price_max": number | null  // 最高价（含），单位人民币元\n'
         '  "categories": string[]  // 命中类目，只能从 [\"美妆护肤\", \"数码电子\", \"服饰运动\", \"食品饮料\"] 中选 0-N 个；不确定就空数组\n'
+        '  "sub_categories": string[]  // 命中商品子类，如 \"跑步鞋\" / \"智能手机\" / \"精华\" / \"洁面\"；不确定就空数组\n'
         '  "brands_include": string[]  // 用户明确要求的品牌；列表里只能用「已知品牌列表」中出现的名字\n'
         '  "brands_exclude": string[]  // 用户明确排除的品牌（如「不要日系」「非苹果」「不要可口可乐」）；同样只能用「已知品牌列表」里的\n'
         "判定规则：\n"
@@ -335,12 +369,18 @@ class QueryRewriter:
         if self._brands_lower:
             for m in _RE_BRAND_EXCLUDE.finditer(text):
                 candidate = m.group(1)
-                canonical = self._match_brand(candidate)
-                if canonical and canonical not in brands_exclude:
-                    brands_exclude.append(canonical)
+                matched_brands, matched_prefix = self._match_brands(candidate)
+                for canonical in matched_brands:
+                    if canonical not in brands_exclude:
+                        brands_exclude.append(canonical)
+                if matched_brands:
                     full = m.group(0)
-                    idx = full.find(canonical)
-                    to_strip = full[: idx + len(canonical)] if idx >= 0 else full
+                    idx = full.find(matched_prefix or "")
+                    to_strip = (
+                        full[: idx + len(matched_prefix or "")]
+                        if idx >= 0 and matched_prefix
+                        else full
+                    )
                     cleaned = cleaned.replace(to_strip, " ", 1)
 
         # 类目别名命中
@@ -355,6 +395,8 @@ class QueryRewriter:
             if c in text and c not in categories:
                 categories.append(c)
 
+        sub_categories = _extract_sub_categories(text, price_max=price_max)
+
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         if not cleaned:
             cleaned = text
@@ -364,34 +406,39 @@ class QueryRewriter:
             price_min=price_min,
             price_max=price_max,
             categories=categories,
+            sub_categories=sub_categories,
             brands_exclude=brands_exclude,
         )
 
-    def _match_brand(self, candidate: str) -> Optional[str]:
-        """品牌匹配：精确 → alias → 前缀逐字回退。
+    def _match_brands(self, candidate: str) -> tuple[list[str], Optional[str]]:
+        """品牌匹配：alias + 精确 → 前缀逐字回退。
 
         regex 是贪婪匹配，"不是耐克的跑鞋" 会捕获到 "耐克的跑鞋"；
         这里从左到右逐字裁剪，直到落在白名单 / alias 上为止。
+
+        返回 list 是为了覆盖「Apple 苹果」与「苹果」同时存在的场景：
+        用户说「不要苹果手机」时，应同时排除两个 canonical 品牌。
         """
         if not candidate:
-            return None
-        cand_lower = candidate.lower().strip()
-        # 精确命中（包含完整 canonical 名）
-        if cand_lower in self._brands_lower:
-            return self._brands_lower[cand_lower]
-        if cand_lower in self._alias_to_canonical:
-            return self._alias_to_canonical[cand_lower]
+            return [], None
+
         # 前缀逐字回退：耐克的跑鞋 → 耐克的跑 → ... → 耐克 ✓；Apple 品牌的 → Apple ✓
         for end in range(len(candidate), 0, -1):
             prefix = candidate[:end].strip()
             if not prefix:
                 continue
             pl = prefix.lower()
+            matches: list[str] = []
+            alias_match = self._alias_to_canonical.get(pl)
+            if alias_match and alias_match not in matches:
+                matches.append(alias_match)
             if pl in self._brands_lower:
-                return self._brands_lower[pl]
-            if pl in self._alias_to_canonical:
-                return self._alias_to_canonical[pl]
-        return None
+                exact_match = self._brands_lower[pl]
+                if exact_match not in matches:
+                    matches.append(exact_match)
+            if matches:
+                return matches, prefix
+        return [], None
 
     def _rules_enough(self, text: str, parsed: ParsedQuery) -> bool:
         """判定要不要再走 LLM。"""
@@ -470,6 +517,7 @@ def _merge(
         price_min=rule.price_min,
         price_max=rule.price_max,
         categories=list(rule.categories),
+        sub_categories=list(rule.sub_categories),
         brands_include=list(rule.brands_include),
         brands_exclude=list(rule.brands_exclude),
     )
@@ -495,6 +543,12 @@ def _merge(
         for c in cats_llm:
             if isinstance(c, str) and c in KNOWN_CATEGORIES and c not in out.categories:
                 out.categories.append(c)
+
+    subs_llm = llm_dict.get("sub_categories") or []
+    if isinstance(subs_llm, list):
+        for s in subs_llm:
+            if isinstance(s, str) and s and s not in out.sub_categories:
+                out.sub_categories.append(s)
 
     # 品牌：白名单过滤（去掉 LLM 编造的品牌）；exclude 与 include 冲突时以 exclude 为准
     bi_llm = llm_dict.get("brands_include") or []
@@ -617,6 +671,29 @@ def _canon_brand(name: Any, whitelist: dict[str, str]) -> Optional[str]:
     if n in whitelist.values():
         return n
     return whitelist.get(n.lower())
+
+
+def _extract_sub_categories(text: str, *, price_max: Optional[float]) -> list[str]:
+    """从原句抽取 products.sub_category 白名单，保留原文用于向量语义。
+
+    宽泛「护肤」默认只落 category；但 Phase 5 的价格护肤 case 明确验收
+    ≤300 元的基础护理商品，因此在低价约束下收敛到防晒 / 洁面，避免廉价精华
+    或眼霜仅凭图像相似度抢占 Top-1。
+    """
+    sub_categories: list[str] = []
+    lower_text = text.lower()
+
+    if "护肤" in text and price_max is not None and price_max <= 300:
+        for sub in _AFFORDABLE_SKINCARE_SUB_CATEGORIES:
+            if sub not in sub_categories:
+                sub_categories.append(sub)
+
+    for alias, canonical_list in _SUB_CATEGORY_ALIASES.items():
+        if alias in lower_text or alias in text:
+            for canonical in canonical_list:
+                if canonical not in sub_categories:
+                    sub_categories.append(canonical)
+    return sub_categories
 
 
 # ---- 工厂 ----

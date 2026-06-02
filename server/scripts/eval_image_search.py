@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from app.config import settings
+from app.agent.query_rewriter import build_query_rewriter
 from app.rag.embedder import build_embedder_from_settings
 from app.utils.logger import get_logger
 
@@ -37,10 +38,14 @@ def _topk_hit(predicted: list[str], expected: list[str], k: int) -> bool:
 async def _build_branch():
     """脱离 FastAPI 容器手动装一个 MultimodalBranch 跑测试。"""
     from app.agent.multimodal_branch import build_multimodal_branch
-    from app.api.deps import get_query_rewriter, get_structured_retriever
+    from app.api.deps import get_structured_retriever
     from app.rag.image_embed_cache import ImageEmbedCache
     from app.rag.milvus_store import COLLECTION_NAME, ProductTextStore
     from app.rag.retriever import RagRetriever
+
+    project_root = Path(__file__).resolve().parents[2]
+    brands = await _load_known_brands(project_root)
+    logger.info("图搜评测加载品牌词表 %d 个", len(brands))
 
     embedder = build_embedder_from_settings()
     dim = embedder.dim  # 探测一次
@@ -51,10 +56,53 @@ async def _build_branch():
         embedder=embedder,
         retriever=retriever,
         cache=ImageEmbedCache(),
-        query_rewriter=get_query_rewriter(),
+        query_rewriter=build_query_rewriter(known_brands=brands),
         structured_retriever=get_structured_retriever(),
     )
     return branch, embedder, store
+
+
+async def _load_known_brands(
+    project_root: Path,
+    *,
+    repo_factory: Any | None = None,
+) -> list[str]:
+    """加载评测用品牌白名单，优先 MySQL，失败时从本地数据集 JSON 回退。
+
+    FastAPI 启动时会把品牌词表注入全局 QueryRewriter；评测脚本脱离 lifespan
+    手动装配，必须显式做同样的事，否则「不要苹果/耐克」不会生成 brand filter。
+    """
+    if repo_factory is None:
+        from app.db.product_repo import ProductRepository
+
+        repo_factory = ProductRepository
+
+    try:
+        repo = repo_factory()
+        brands = await repo.list_brands()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MySQL 拉品牌失败，从本地数据集回退：%s", exc)
+        brands = []
+
+    if not brands:
+        brands = _load_brands_from_dataset(project_root)
+
+    return sorted({b.strip() for b in brands if isinstance(b, str) and b.strip()})
+
+
+def _load_brands_from_dataset(project_root: Path) -> list[str]:
+    dataset_root = project_root / "ecommerce_agent_dataset"
+    brands: list[str] = []
+    for path in dataset_root.glob("*/data/*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("跳过无法读取的数据文件 %s：%s", path, exc)
+            continue
+        brand = payload.get("brand")
+        if isinstance(brand, str) and brand.strip():
+            brands.append(brand.strip())
+    return brands
 
 
 async def main() -> None:
@@ -101,9 +149,30 @@ async def main() -> None:
         else:
             filter_expr = 'chunk_type in ["image", "title"]'
 
-        hits = store.search(query_vector=vec, top_k=30, filter_expr=filter_expr)
+        search_top_k = 80 if parsed.brands_exclude and parsed.sub_categories else 30
+        hits = store.search(query_vector=vec, top_k=search_top_k, filter_expr=filter_expr)
         from app.rag.retriever import _aggregate
-        products = _aggregate(hits, top_n_products=args.top_n_products)
+        aggregate_top_n = max(args.top_n_products, 20) if parsed.brands_exclude else args.top_n_products
+        products = _aggregate(hits, top_n_products=aggregate_top_n)
+        if parsed.brands_exclude and parsed.sub_categories:
+            from app.agent.multimodal_branch import (
+                CHUNK_TYPE_FILTER,
+                rerank_multimodal_products,
+                select_source_hint_from_hits,
+            )
+
+            source_hits = store.search(
+                query_vector=vec,
+                top_k=10,
+                filter_expr=CHUNK_TYPE_FILTER,
+            )
+            source_hint = select_source_hint_from_hits(source_hits, parsed)
+            products = rerank_multimodal_products(
+                products,
+                parsed=parsed,
+                source_hint=source_hint,
+            )
+        products = products[:args.top_n_products]
         predicted_pids = [p.product_id for p in products]
         record = {
             "case_id": c["case_id"],

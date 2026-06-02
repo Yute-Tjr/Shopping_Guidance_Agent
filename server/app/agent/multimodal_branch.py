@@ -17,7 +17,7 @@ filter_expr 拼接策略：
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 from app.agent.query_rewriter import ParsedQuery, QueryRewriter
 from app.rag.image_embed_cache import ImageEmbedCache
@@ -119,7 +119,11 @@ class MultimodalBranch:
             filter_expr = CHUNK_TYPE_FILTER
 
         # 4) retrieve：绕过 RagRetriever.search 的 embed 步骤，用现成向量直查
-        hits = self._search_with_vector(query_vector=vec, filter_expr=filter_expr)
+        hits = self._search_with_vector(
+            query_vector=vec,
+            filter_expr=filter_expr,
+            parsed=parsed,
+        )
 
         return MultimodalResult(
             query_vector=vec, retrieved=hits, parsed=parsed, image_lost=image_lost,
@@ -130,6 +134,7 @@ class MultimodalBranch:
         *,
         query_vector: list[float],
         filter_expr: str | None,
+        parsed: ParsedQuery,
     ) -> list[RetrievedProduct]:
         """绕过 RagRetriever.search 的 embed 步骤，用现成向量直查。
 
@@ -137,14 +142,86 @@ class MultimodalBranch:
         我们已经有 multimodal embed 出的向量，直接走底层 store + 复用 _aggregate。
         """
         from app.rag.retriever import _aggregate  # 包内私有，但同包内复用合理
+        top_k = 80 if _needs_source_tier_hint(parsed) else 30
         hits = self.retriever.store.search(
             query_vector=query_vector,
-            top_k=30,
+            top_k=top_k,
             filter_expr=filter_expr,
         )
         if not hits:
             return []
-        return _aggregate(hits, top_n_products=5)
+        products = _aggregate(hits, top_n_products=20 if _needs_source_tier_hint(parsed) else 5)
+
+        source_hint: RetrievedProduct | None = None
+        if _needs_source_tier_hint(parsed):
+            source_hits = self.retriever.store.search(
+                query_vector=query_vector,
+                top_k=10,
+                filter_expr=CHUNK_TYPE_FILTER,
+            )
+            source_hint = select_source_hint_from_hits(source_hits, parsed)
+        return rerank_multimodal_products(
+            products,
+            parsed=parsed,
+            source_hint=source_hint,
+        )[:5]
+
+
+def _needs_source_tier_hint(parsed: ParsedQuery) -> bool:
+    return bool(parsed.brands_exclude and parsed.sub_categories)
+
+
+def select_source_hint_from_hits(
+    hits: Sequence[dict],
+    parsed: ParsedQuery,
+) -> RetrievedProduct | None:
+    """从未过滤图搜结果中选原图商品，用于 brand-exclude 后的同价位重排。"""
+    if not hits or not parsed.brands_exclude:
+        return None
+    from app.rag.retriever import _aggregate
+
+    products = _aggregate(hits, top_n_products=5)
+    for product in products:
+        if product.brand in parsed.brands_exclude:
+            return product
+    return None
+
+
+def rerank_multimodal_products(
+    products: list[RetrievedProduct],
+    *,
+    parsed: ParsedQuery,
+    source_hint: RetrievedProduct | None,
+) -> list[RetrievedProduct]:
+    """品牌排除场景下，用原图商品价格层级做轻量重排。
+
+    典型 case：用户上传 iPhone Pro 图并说「不要苹果的手机」。品牌过滤后，
+    向量相似度可能把低价大屏机或折叠屏排到前面；但业务上更接近的是同为
+    高端旗舰价位的非 Apple 手机。这里只在能识别出被排除原商品时启用。
+    """
+    if (
+        not products
+        or not source_hint
+        or not parsed.brands_exclude
+        or source_hint.brand not in parsed.brands_exclude
+        or source_hint.base_price <= 0
+    ):
+        return products
+
+    source_price = source_hint.base_price
+
+    def tier_score(product: RetrievedProduct) -> float:
+        if product.base_price <= 0:
+            return 0.0
+        gap = abs(product.base_price - source_price) / source_price
+        return 1.0 - min(gap, 1.0)
+
+    ranked = sorted(
+        enumerate(products),
+        key=lambda item: (tier_score(item[1]), item[1].score, -item[0]),
+        reverse=True,
+    )
+    return [product for _, product in ranked]
 
 
 def build_multimodal_branch(

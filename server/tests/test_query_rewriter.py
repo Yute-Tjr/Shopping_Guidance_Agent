@@ -38,10 +38,14 @@ def test_filter_expr_category_and_brand_exclude():
     pq = ParsedQuery(
         search_query="跑鞋",
         categories=["服饰运动"],
+        sub_categories=["跑步鞋"],
         brands_exclude=["耐克"],
     )
     expr = pq.to_filter_expr()
-    assert expr == 'category in ["服饰运动"] and brand not in ["耐克"]'
+    assert expr == (
+        'category in ["服饰运动"] and sub_category in ["跑步鞋"] '
+        'and brand not in ["耐克"]'
+    )
 
 
 def test_filter_expr_escapes_double_quote_in_brand():
@@ -114,6 +118,42 @@ async def test_rules_categories_alias_hit():
     rw = build_query_rewriter()
     pq = await rw.parse("推荐一款笔记本")
     assert "数码电子" in pq.categories
+
+
+@pytest.mark.asyncio
+async def test_rules_sub_category_alias_enters_filter_expr():
+    rw = build_query_rewriter()
+    pq = await rw.parse("600 以下的精华")
+    assert pq.price_max == 600
+    assert pq.sub_categories == ["精华"]
+    assert pq.to_filter_expr() == 'min_sku_price <= 600 and sub_category in ["精华"]'
+
+
+@pytest.mark.asyncio
+async def test_rules_running_shoe_alias_filters_exact_sub_category():
+    rw = build_query_rewriter()
+    pq = await rw.parse("1000 元以下的跑鞋")
+    assert "服饰运动" in pq.categories
+    assert pq.sub_categories == ["跑步鞋"]
+    assert 'sub_category in ["跑步鞋"]' in (pq.to_filter_expr() or "")
+
+
+@pytest.mark.asyncio
+async def test_rules_skincare_price_uses_phase5_affordable_care_boundary():
+    rw = build_query_rewriter()
+    pq = await rw.parse("300 元以下的护肤")
+    assert pq.price_max == 300
+    assert "美妆护肤" in pq.categories
+    assert pq.sub_categories == ["防晒", "洁面"]
+    assert 'sub_category in ["防晒", "洁面"]' in (pq.to_filter_expr() or "")
+
+
+@pytest.mark.asyncio
+async def test_rules_brand_exclude_keeps_subject_sub_category():
+    rw = build_query_rewriter(known_brands=["雅诗兰黛", "兰蔻"])
+    pq = await rw.parse("不要雅诗兰黛的精华")
+    assert pq.brands_exclude == ["雅诗兰黛"]
+    assert pq.sub_categories == ["精华"]
 
 
 # ---------- LLM 兜底 ----------
@@ -366,6 +406,14 @@ async def test_compound_brand_name_matches_partial_token():
     pq2 = await rw.parse("不要苹果手机")
     assert "Apple 苹果" in pq1.brands_exclude
     assert "Apple 苹果" in pq2.brands_exclude
+
+
+@pytest.mark.asyncio
+async def test_brand_exclude_apple_alias_excludes_compound_and_plain_brand():
+    """数据里同时有「Apple 苹果」和「苹果」时，中文别名应同时排除两者。"""
+    rw = build_query_rewriter(known_brands=["Apple 苹果", "苹果", "小米"])
+    pq = await rw.parse("不要苹果的手机")
+    assert pq.brands_exclude == ["Apple 苹果", "苹果"]
 
 
 @pytest.mark.asyncio
