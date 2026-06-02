@@ -9,6 +9,18 @@ class Settings(BaseSettings):
     ark_api_key: str = "ark-placeholder"
     ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
     ark_model: str = "ep-20260514111645-lmgt2"
+    # ---- Volc OpenSpeech Audio ----
+    # 复用 ARK_API_KEY；如需语音单独 key，可在 .env 配 ARK_AUDIO_API_KEY 覆盖。
+    ark_audio_api_key: str | None = None
+    ark_tts_endpoint: str = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
+    ark_asr_endpoint: str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+    ark_asr_model: str = "Speech_Recognition_Seed_streaming2000000781793693122"
+    ark_asr_model_name: str = "bigmodel"
+    ark_asr_resource_id: str | None = None
+    ark_tts_model: str = "TTS-SeedTTS2.02000000781762207298"
+    ark_tts_resource_id: str | None = None
+    ark_tts_default_voice: str = "saturn_zh_female_cancan_tob"
+    ark_tts_sample_rate: int = 24000
 
     # ---- Embedding ----
     # 留空时回退到 ark_api_key；当 LLM 与 Embedding 不在同一个方舟账号下时，

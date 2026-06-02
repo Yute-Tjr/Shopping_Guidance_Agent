@@ -38,10 +38,16 @@ struct ChatView: View {
         let api = APIClient(baseURL: env.baseURL)
         let transport = LiveChatTransport(api: api)
         let upload = UploadService(baseURL: env.baseURL)
+        let audio = AudioService(baseURL: env.baseURL)
         _viewModel = StateObject(wrappedValue: ChatViewModel(
             transport: transport,
             initialSessionID: env.sessionID,
-            uploadService: upload
+            uploadService: upload,
+            speechRecognizer: ServerSpeechRecognitionService(
+                api: audio,
+                fallback: SpeechRecognitionService()
+            ),
+            speechSpeaker: ServerSpeechSynthesisService(api: audio)
         ))
     }
 
@@ -116,6 +122,42 @@ struct ChatView: View {
 
             Spacer()
 
+            Menu {
+                ForEach(SpeechVoice.all) { voice in
+                    Button {
+                        viewModel.selectedVoice = voice
+                    } label: {
+                        Label(
+                            voice.displayName,
+                            systemImage: viewModel.selectedVoice == voice ? "checkmark" : "waveform"
+                        )
+                    }
+                }
+            } label: {
+                Image(systemName: "waveform.circle")
+                    .font(.system(size: 20))
+                    .foregroundStyle(Theme.Palette.brand)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Theme.Palette.chipSoft))
+            }
+            .accessibilityLabel("选择播报音色")
+
+            Button {
+                viewModel.autoSpeakEnabled.toggle()
+                if !viewModel.autoSpeakEnabled {
+                    viewModel.stopSpeaking()
+                }
+            } label: {
+                Image(systemName: viewModel.autoSpeakEnabled
+                      ? "speaker.wave.2.circle.fill"
+                      : "speaker.wave.2.circle")
+                    .font(.system(size: 20))
+                    .foregroundStyle(Theme.Palette.brand)
+                    .frame(width: 34, height: 34)
+                    .background(Circle().fill(Theme.Palette.chipSoft))
+            }
+            .accessibilityLabel(viewModel.autoSpeakEnabled ? "关闭自动播报" : "开启自动播报")
+
             Button {
                 viewModel.resetSession()
             } label: {
@@ -165,6 +207,9 @@ struct ChatView: View {
                         },
                         onSelectProduct: { card in
                             productNavigation.select(productID: card.productId)
+                        },
+                        onSpeakAssistant: { text in
+                            viewModel.speakAssistantText(text)
                         }
                     )
                     .equatable()
@@ -310,6 +355,15 @@ struct ChatView: View {
                     .padding(.top, 6)
             }
 
+            if let notice = viewModel.voiceNotice {
+                Text(notice)
+                    .font(Theme.Typo.caption())
+                    .foregroundStyle(Theme.Palette.priceHot)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, Theme.Spacing.l)
+                    .padding(.top, 6)
+            }
+
             // Phase 5：选好图但还没发送时显示的缩略图条
             if let picked = viewModel.pickedImage {
                 HStack(spacing: Theme.Spacing.s) {
@@ -345,6 +399,28 @@ struct ChatView: View {
                     errorMessage: $viewModel.uploadNotice,
                 )
                 .frame(width: 32, height: 32)
+
+                Button {
+                    if viewModel.isListening {
+                        viewModel.stopVoiceInput()
+                    } else {
+                        inputFocused = false
+                        Task { await viewModel.startVoiceInput() }
+                    }
+                } label: {
+                    Image(systemName: viewModel.isListening ? "mic.circle.fill" : "mic.fill")
+                        .font(.system(size: 17, weight: .semibold))
+                        .foregroundStyle(viewModel.isListening ? .white : Theme.Palette.brand)
+                        .frame(width: 32, height: 32)
+                        .background(
+                            Circle().fill(viewModel.isListening
+                                          ? Theme.Palette.brand
+                                          : Theme.Palette.chipSoft)
+                        )
+                }
+                .disabled(viewModel.isSending)
+                .opacity(viewModel.isSending ? 0.45 : 1)
+                .accessibilityLabel(viewModel.isListening ? "停止语音输入" : "开始语音输入")
 
                 HStack(spacing: Theme.Spacing.s) {
                     TextField(

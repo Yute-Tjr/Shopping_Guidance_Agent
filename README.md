@@ -71,7 +71,7 @@ cd ./client
   - [x] 子项 2：多商品对比（CompareTargetExtractor + 并行检索 + GFM 表格 Prompt）([详情](#phase-4-2-多商品对比))
   - [x] 子项 3：主动澄清（ClarifyDetector + 13 类目 chips 模板）([详情](#phase-4-3-主动澄清))
   - [x] 子项 4：多轮 memory 摘要压缩（MemorySummarizer + summary 注入 prompt）([详情](#phase-4-4-多轮-memory-摘要压缩))
-- [~] **Phase 5**：多模态图搜（拍照找货）—— server + iOS 代码闭环，待真实灌图索引 + 评测 / 模拟器手动验收 ([详情](#phase-5-多模态图搜)，[设计文档](docs/05_多模态图搜设计.md)，[执行计划](docs/phase5_implementation_plan.md))
+- [~] **Phase 5**：多模态图搜（拍照找货）—— server + iOS 代码闭环，待真实灌图索引 + 评测 / 模拟器手动验收 ([详情](#phase-5-多模态图搜)，[设计文档](docs/05_多模态设计)，[执行计划](docs/phase5_implementation_plan.md))
 - [ ] Phase 6：打磨与交付
 
 ---
@@ -825,7 +825,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 
 ## Phase 5 多模态图搜
 
-> 详细设计 [`docs/05_多模态图搜设计.md`](docs/05_多模态图搜设计.md)；执行计划 [`docs/phase5_implementation_plan.md`](docs/phase5_implementation_plan.md)。
+> 详细设计 [`docs/05_多模态图搜设计.md`](docs/05_多模态设计)；执行计划 [`docs/phase5_implementation_plan.md`](docs/phase5_implementation_plan.md)。
 
 在 Phase 4 对话能力之上叠加**多模态输入路径**：iOS 端拍照/选图 + 可选文字 → 二段式上传 → vision embedding 检索 + Phase 4 结构化筛选融合 → 商品推荐流。Task 1-7 = server 侧闭环，Task 8-9 = iOS 闭环，Task 10 = 黄金集评测，Task 11 = 文档收尾。
 

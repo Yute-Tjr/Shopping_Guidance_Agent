@@ -23,10 +23,20 @@ public final class ChatViewModel: ObservableObject {
     @Published public var pickedImage: PickedImage? = nil
     /// Phase 5：上传 / 多模态错误的提示文案（如 vision API 限流降级时）。
     @Published public var uploadNotice: String? = nil
+    /// Phase 5C：语音输入是否正在录音识别。
+    @Published public var isListening: Bool = false
+    /// Phase 5C：语音权限 / 识别错误提示。
+    @Published public var voiceNotice: String? = nil
+    /// Phase 5C：是否在 assistant 回复结束后自动播报。
+    @Published public var autoSpeakEnabled: Bool = false
+    /// Phase 5C：TTS 播报音色。
+    @Published public var selectedVoice: SpeechVoice = .default
 
     private let transport: ChatTransport
     /// Phase 5：注入 UploadService 启用图片上传链路；nil 时纯文本模式（兼容测试 / pre-Phase5 场景）。
     private let uploadService: UploadService?
+    private let speechRecognizer: SpeechRecognizing?
+    private let speechSpeaker: SpeechSpeaking?
 
     /// 流式 token 节流缓冲：后端 SSE 每秒可能推 30+ chunk，每个 chunk 直接写 messages.text
     /// 会触发 ScrollView ViewSizeCache miss → 全量 sizeThatFits 重测，主线程 100% CPU。
@@ -36,15 +46,20 @@ public final class ChatViewModel: ObservableObject {
     private static let tokenFlushIntervalNs: UInt64 = 100_000_000  // 100ms
     private var activeSendTask: Task<Void, Never>?
     private var activeTurnID = UUID()
+    private var activeVoiceTurnID = UUID()
 
     public init(
         transport: ChatTransport,
         initialSessionID: String? = nil,
-        uploadService: UploadService? = nil
+        uploadService: UploadService? = nil,
+        speechRecognizer: SpeechRecognizing? = nil,
+        speechSpeaker: SpeechSpeaking? = nil
     ) {
         self.transport = transport
         self.sessionID = initialSessionID
         self.uploadService = uploadService
+        self.speechRecognizer = speechRecognizer
+        self.speechSpeaker = speechSpeaker
     }
 
     /// 发送当前 inputText（+ 可选 pickedImage）。空白且无图直接忽略。
@@ -53,6 +68,9 @@ public final class ChatViewModel: ObservableObject {
         let picked = pickedImage
         guard !text.isEmpty || picked != nil else { return }
         guard !isSending else { return }
+        if isListening {
+            cancelVoiceInput()
+        }
         let turnID = UUID()
         activeTurnID = turnID
 
@@ -72,17 +90,12 @@ public final class ChatViewModel: ObservableObject {
         isSending = true
         uploadNotice = nil
 
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.runSend(
-                text: text,
-                picked: picked,
-                assistantIndex: assistantIndex,
-                turnID: turnID
-            )
-        }
-        activeSendTask = task
-        await task.value
+        await runSend(
+            text: text,
+            picked: picked,
+            assistantIndex: assistantIndex,
+            turnID: turnID
+        )
     }
 
     private func runSend(
@@ -154,6 +167,10 @@ public final class ChatViewModel: ObservableObject {
                 // 流式结束：必须把残余 buffer flush 完再翻 isStreaming，否则末尾几个 token 会丢
                 flushPendingTokens(into: assistantIndex, turnID: turnID)
                 messages[assistantIndex].isStreaming = false
+                if autoSpeakEnabled {
+                    speakAssistantText(messages[assistantIndex].text)
+                }
+                return
             }
         }
         // 兜底：upstream 流意外中断（未发 .done）时也把 buffer 排空
@@ -191,9 +208,68 @@ public final class ChatViewModel: ObservableObject {
         activeTurnID == turnID && !Task.isCancelled
     }
 
+    /// Phase 5C：启动语音输入，partial transcript 实时写入 inputText。
+    public func startVoiceInput() async {
+        guard !isSending else { return }
+        guard let speechRecognizer else {
+            voiceNotice = "语音输入暂不可用"
+            return
+        }
+        let voiceTurnID = UUID()
+        activeVoiceTurnID = voiceTurnID
+        voiceNotice = nil
+        do {
+            try await speechRecognizer.start { [weak self] transcript in
+                guard let self, self.activeVoiceTurnID == voiceTurnID else { return }
+                self.inputText = transcript
+            } onCompletion: { [weak self] error in
+                guard let self, self.activeVoiceTurnID == voiceTurnID else { return }
+                self.isListening = false
+                if let error, let notice = Self.voiceNotice(for: error) {
+                    self.voiceNotice = notice
+                }
+            }
+            guard activeVoiceTurnID == voiceTurnID else {
+                speechRecognizer.stop()
+                return
+            }
+            isListening = true
+        } catch {
+            guard activeVoiceTurnID == voiceTurnID else { return }
+            isListening = false
+            voiceNotice = Self.voiceNotice(for: error)
+        }
+    }
+
+    public func stopVoiceInput() {
+        speechRecognizer?.stop()
+        isListening = false
+    }
+
+    public func speakAssistantText(_ text: String) {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        speechSpeaker?.speak(trimmed, voice: selectedVoice)
+    }
+
+    public func stopSpeaking() {
+        speechSpeaker?.stop()
+    }
+
+    private static func voiceNotice(for error: Error) -> String? {
+        if let speechError = error as? SpeechRecognitionError {
+            if speechError.isEmptySpeech {
+                return nil
+            }
+            return speechError.localizedDescription
+        }
+        return error.localizedDescription
+    }
+
     /// 新建会话：停止当前流、清空消息 / 输入 / sessionID，并立即解锁输入栏。
     public func resetSession() {
-        activeSendTask?.cancel()
+        // 不直接 cancel activeSendTask：底层 AsyncStream/SSE 在取消后不一定立即结束，
+        // 外层 await send() 可能被挂住。activeTurnID 失效足以让旧流事件不再写 UI。
         activeSendTask = nil
         activeTurnID = UUID()
         pendingFlushTask?.cancel()
@@ -205,5 +281,21 @@ public final class ChatViewModel: ObservableObject {
         isSending = false
         pickedImage = nil
         uploadNotice = nil
+        cancelVoiceInput()
+        stopSpeaking()
+        voiceNotice = nil
+    }
+
+    private func cancelVoiceInput() {
+        activeVoiceTurnID = UUID()
+        speechRecognizer?.stop()
+        isListening = false
+    }
+}
+
+private extension SpeechRecognitionError {
+    var isEmptySpeech: Bool {
+        guard case .recognitionFailed(let message) = self else { return false }
+        return message.contains("ASR 返回空文本") || message.contains("没有录到语音")
     }
 }

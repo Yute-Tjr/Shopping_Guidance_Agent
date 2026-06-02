@@ -1,14 +1,14 @@
-# Phase 5 多模态图搜实施计划
+# Phase 5 多模态交互实施计划
 
 > **设计文档：** `docs/05_多模态图搜设计.md`（先读它了解决策背景再开工）。
 > **执行节奏：** 每个 Task 末尾**不自动 commit**——按用户偏好"由我手动 commit"，agent 跑完测试后等用户人工拍板。
 > **进度跟踪：** 每个 step 是 `- [ ]` checkbox，做完打勾。
 
-**Goal:** 给 Phase 4 已经成熟的"对话能力增强"链路叠加多模态输入路径，达成"上传图 + 可选文字 → vision embedding 检索 + Phase 4 结构化筛选融合 → 商品推荐流"。
+**Goal:** 给 Phase 4 已经成熟的"对话能力增强"链路叠加多模态交互路径，达成"上传图 + 可选文字 → vision embedding 检索 + Phase 4 结构化筛选融合 → 商品推荐流"，并补齐 5C 语音输入 / TTS 语音播报能力。
 
-**Architecture:** 复用现有 `products_text` collection（chunk_type='image' 标量隔离）；二段式 API（`/upload/image` → image_id → `/chat`）；orchestrator 入口按 `image_id` 是否非空分流到 `MultimodalBranch`；Phase 4 的 query_rewriter / structured filter 全部零侵入复用，multimodal 路径只是把 query_vector 换成多模态编码。
+**Architecture:** 5B 图搜复用现有 `products_text` collection（chunk_type='image' 标量隔离）；二段式 API（`/upload/image` → image_id → `/chat`）；orchestrator 入口按 `image_id` 是否非空分流到 `MultimodalBranch`；Phase 4 的 query_rewriter / structured filter 全部零侵入复用。5C 语音交互升级为服务端音频网关：iOS 录 16k PCM → `/audio/asr` → 豆包语音 OpenSpeech ASR → inputText；assistant 文本 → `/audio/tts` → 豆包语音 OpenSpeech TTS → WAV 播放。端侧 Speech.framework 仅作为 ASR 降级；TTS 取消 AVSpeechSynthesizer 原生朗读模式。
 
-**Tech Stack:** FastAPI / Pydantic v2 / Milvus Lite / Doubao multimodal_embeddings / Pillow / SwiftUI / PhotosUI / pytest-asyncio。
+**Tech Stack:** FastAPI / Pydantic v2 / Milvus Lite / Doubao multimodal_embeddings / Volc OpenSpeech ASR/TTS / WebSocket binary protocol / Pillow / SwiftUI / PhotosUI / AVFoundation / Speech.framework fallback / pytest-asyncio / Swift Testing。
 
 ---
 
@@ -27,6 +27,13 @@
 | 9 | iOS ChatView + MessageBubble UI | 输入栏相机按钮 + 缩略图气泡 |
 | 10 | 评测黄金集 + 评测脚本 + Smoke | 4 类指标产出报告 |
 | 11 | README + 最终验收 | 文档化 Phase 5 |
+| 12 | 5C 协议与 ViewModel 逻辑测试 | 语音输入/TTS 可测边界 |
+| 13 | 5C iOS 语音输入基础服务 | Speech.framework 仅作为 ASR 降级 |
+| 14 | 5C Chat UI 接入 | 麦克风按钮、播报按钮、自动播报开关 |
+| 15 | 5C 权限与验收 | Info.plist 权限、Swift/Xcode 验证 |
+| 16 | 5C 服务端 ASR/TTS API | `/audio/asr`、`/audio/tts`、voices |
+| 17 | 5C iOS 远端音频重构 | PCM 上传 ASR、WAV TTS 播放、本地降级 |
+| 18 | 5C 音色选择 | Header voice 菜单、selectedVoice 透传 |
 
 ---
 
@@ -2716,6 +2723,328 @@ Phase 5 是**纯增量**——所有 Phase 1-4 文件零回退。新增分支处
 
 ---
 
+## Task 12: 5C 协议与 ViewModel 逻辑测试
+
+**Files:**
+- Create: `client/ShoppingGuide/Features/Chat/SpeechRecognitionService.swift`
+- Create: `client/ShoppingGuide/Features/Chat/SpeechSynthesisService.swift`
+- Modify: `client/ShoppingGuide/Features/Chat/ChatViewModel.swift`
+- Test: `client/Tests/ShoppingGuideKitTests/ChatViewModelTests.swift`
+
+- [x] **Step 12.1: 写失败的 Swift 逻辑测试**
+
+新增 fake speech recognizer / speaker，覆盖：
+
+```swift
+@Test func voiceInputPartialTranscriptUpdatesInputText() async
+@Test func voiceInputFailureSetsNoticeAndStopsListening() async
+@Test func sendStopsActiveVoiceInputBeforeStreaming() async
+@Test func resetSessionStopsVoiceAndSpeechOutput() async
+@Test func autoSpeakReadsAssistantReplyAfterDone() async
+@Test func voiceInputCompletionStopsListening() async
+@Test func staleVoiceCompletionAfterResetDoesNotMutateNewSession() async
+```
+
+Expected red: `ChatViewModel` 还没有 `startVoiceInput()` / `stopVoiceInput()` / `speakAssistantText()` / `autoSpeakEnabled` 等成员。
+
+- [x] **Step 12.2: 定义可测试协议**
+
+`SpeechRecognizing`：
+
+```swift
+public protocol SpeechRecognizing: Sendable {
+    @MainActor
+    func start(
+        onPartialResult: @escaping @MainActor @Sendable (String) -> Void,
+        onCompletion: @escaping @MainActor @Sendable (SpeechRecognitionError?) -> Void
+    ) async throws
+
+    @MainActor
+    func stop()
+}
+```
+
+`SpeechSpeaking`：
+
+```swift
+public protocol SpeechSpeaking: Sendable {
+    @MainActor
+    func speak(_ text: String, voice: SpeechVoice)
+
+    @MainActor
+    func stop()
+}
+```
+
+- [x] **Step 12.3: ViewModel 最小接入**
+
+`ChatViewModel` 新增：
+
+```swift
+@Published public var isListening: Bool = false
+@Published public var voiceNotice: String? = nil
+@Published public var autoSpeakEnabled: Bool = false
+```
+
+并注入：
+
+```swift
+private let speechRecognizer: SpeechRecognizing?
+private let speechSpeaker: SpeechSpeaking?
+```
+
+新增行为：
+- `startVoiceInput()`：启动 recognizer，partial 写入 `inputText`
+- `stopVoiceInput()`：停止 recognizer，`isListening=false`
+- `send()` 开头取消当前录音，避免旧 ASR 回调污染本轮发送
+- `.done` 后如果 `autoSpeakEnabled`，播报 assistant 文本
+- `resetSession()` 停止录音与播报
+- `.done` 视为本轮流式结束，立即结束 `send()`，避免底层流未 finish 时输入栏被长时间锁住
+
+---
+
+## Task 13: 5C iOS 语音输入基础服务
+
+**Files:**
+- Modify: `client/ShoppingGuide/Features/Chat/SpeechRecognitionService.swift`
+- Test: Xcode build
+
+- [x] **Step 13.1: 实现 iOS SpeechRecognitionService**
+
+生产实现只在 iOS App 编译路径使用，封装：
+- `SFSpeechRecognizer(locale: Locale(identifier: "zh-CN"))`
+- `SFSpeechAudioBufferRecognitionRequest`
+- `SFSpeechRecognitionTask`
+- `AVAudioEngine`
+- `SFSpeechRecognizer.requestAuthorization`
+- `AVAudioSession.requestRecordPermission`
+
+错误映射：
+- speech 权限拒绝：`SpeechRecognitionError.permissionDenied`
+- 麦克风权限拒绝：`SpeechRecognitionError.microphoneDenied`
+- recognizer 不可用：`SpeechRecognitionError.unavailable`
+- task error：`SpeechRecognitionError.recognitionFailed(message:)`
+
+- [x] **Step 13.2: 取消原生 TTS 朗读**
+
+TTS 不再实现 `AVSpeechSynthesizer` 本地朗读降级。播报统一走服务端 `/api/v1/audio/tts` + OpenSpeech 音色，避免用户选择的 voice id 与系统本地音色不一致。
+
+---
+
+## Task 14: 5C Chat UI 接入
+
+**Files:**
+- Modify: `client/ShoppingGuide/Features/Chat/ChatView.swift`
+- Modify: `client/ShoppingGuide/Features/Chat/MessageBubble.swift`
+- Test: Xcode build + 手动 UI
+
+- [x] **Step 14.1: 输入栏新增麦克风按钮**
+
+按钮位置：相册按钮右侧、输入框左侧。
+
+状态：
+- 未录音：`mic.fill`
+- 录音中：`mic.circle.fill`，品牌橙高亮
+- 发送中禁用录音按钮
+
+交互：
+- 点击未录音 → `await viewModel.startVoiceInput()`
+- 点击录音中 → `viewModel.stopVoiceInput()`
+
+- [x] **Step 14.2: Header 新增自动播报开关**
+
+在新建会话按钮左侧加 speaker 图标：
+- 关闭：`speaker.wave.2.circle`
+- 开启：`speaker.wave.2.circle.fill`
+- 点击切换 `viewModel.autoSpeakEnabled`
+
+- [x] **Step 14.3: MessageBubble 新增 assistant 播报按钮**
+
+assistant 非 streaming 且正文非空时，气泡下方显示小 speaker 图标按钮。
+点击调用 `onSpeakAssistant?(message.text)`。
+
+---
+
+## Task 15: 5C 权限、验收与构建
+
+**Files:**
+- Modify: `client/ShoppingGuide.xcodeproj/project.pbxproj`
+- Test: `client` SwiftPM 测试（若当前工具链支持）+ Xcode build
+
+- [x] **Step 15.1: 写入自动生成 Info.plist 权限描述**
+
+Debug / Release 均新增：
+
+```text
+INFOPLIST_KEY_NSMicrophoneUsageDescription = "PriceCat 需要使用麦克风把你的语音问题转换为文字。";
+INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "PriceCat 需要使用语音识别把你的语音问题转换为文字。";
+```
+
+- [ ] **Step 15.2: 验收场景**
+
+手动验证：
+- 点击麦克风，说“推荐蓝牙耳机” → 输入框出现转写文本
+- 停止录音后点击发送 → 正常收到推荐
+- assistant 回复后点击播报 → 听到语音播报
+- 打开自动播报后发一条新消息 → assistant 完成后自动播报
+- 新建会话时正在录音/播报 → 录音和播报立即停止
+- 权限拒绝时文本输入和图片上传仍可用
+
+状态：需要在实际前端/真机或可用麦克风的模拟器中手动验证。当前已通过 ViewModel 单测覆盖状态迁移，且已确认构建产物 Info.plist 包含语音权限键。
+
+- [x] **Step 15.3: 最终验证**
+
+Run:
+
+```bash
+cd client && swift test
+```
+
+如果本机 SwiftPM 工具链仍因 `no such module 'Testing'` 失败，记录原因并继续用 Xcode build 验证 App 编译。
+
+Run:
+
+```bash
+/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild \
+  -project client/ShoppingGuide.xcodeproj \
+  -scheme ShoppingGuide \
+  -destination "generic/platform=iOS Simulator" \
+  -derivedDataPath /private/tmp/ShoppingGuideDerivedData \
+  CODE_SIGNING_ALLOWED=NO build
+```
+
+Expected: `** BUILD SUCCEEDED **`
+
+本次实现已执行：
+- `server/.venv/bin/python -m pytest server/tests`：217 tests passed
+- `swift test --scratch-path /private/tmp/ShoppingGuideSwiftPM --cache-path /private/tmp/ShoppingGuideSwiftPMCache`：46 tests passed
+- `xcodebuild -project client/ShoppingGuide.xcodeproj -scheme ShoppingGuide -destination "generic/platform=iOS Simulator" -derivedDataPath /private/tmp/ShoppingGuideDerivedData CODE_SIGNING_ALLOWED=NO build`：`** BUILD SUCCEEDED **`
+- `plutil -p /private/tmp/ShoppingGuideDerivedData/Build/Products/Debug-iphonesimulator/ShoppingGuide.app/Info.plist`：包含 `NSMicrophoneUsageDescription` 与 `NSSpeechRecognitionUsageDescription`
+
+---
+
+## Task 16: 5C 服务端 ASR/TTS API
+
+**Files:**
+- Create: `server/app/audio/__init__.py`
+- Create: `server/app/audio/ark_audio_client.py`
+- Create: `server/app/api/audio.py`
+- Modify: `server/app/config.py`
+- Modify: `server/app/main.py`
+- Test: `server/tests/test_audio_api.py`
+
+- [x] **Step 16.1: 方舟音频配置**
+
+新增配置项：
+
+```env
+ARK_ASR_MODEL=Speech_Recognition_Seed_streaming2000000781793693122
+ARK_ASR_MODEL_NAME=bigmodel
+ARK_TTS_MODEL=TTS-SeedTTS2.02000000781762207298
+ARK_TTS_DEFAULT_VOICE=saturn_zh_female_cancan_tob
+# 可选覆盖；默认即官方 OpenSpeech 网关：
+# ARK_ASR_ENDPOINT=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel
+# ARK_TTS_ENDPOINT=wss://openspeech.bytedance.com/api/v3/tts/bidirection
+ARK_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
+ARK_TTS_RESOURCE_ID=seed-tts-2.0
+```
+
+API key 默认复用 `ARK_EMBEDDING_API_KEY` 或 `ARK_API_KEY`；如后续语音单独 key，可配 `ARK_AUDIO_API_KEY`。
+联调时若握手返回 HTTP 401，优先检查 `X-Api-Key` 是否来自豆包语音新版控制台 API Key，以及 `X-Api-Resource-Id` 是否与控制台开通的 ASR/TTS 商品一致。
+
+- [x] **Step 16.2: ArkAudioService**
+
+`ArkAudioService` 封装 OpenSpeech WebSocket：
+- 建连：请求头 `X-Api-Key`、`X-Api-Resource-Id`、`X-Api-Request-Id`、`X-Api-Connect-Id`
+- ASR：连接 `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel`，发送 gzip JSON full request，再按 200ms 左右分片发送 audio-only 二进制帧，收集 `result.text`
+- TTS：连接 `wss://openspeech.bytedance.com/api/v3/tts/bidirection`，发送 StartConnection / StartSession / TaskRequest / FinishSession 事件帧，收集 audio-only PCM，最终包装成 WAV
+
+- [x] **Step 16.3: Audio API**
+
+新增：
+- `GET /api/v1/audio/voices`
+- `POST /api/v1/audio/asr`：multipart `audio/pcm`，16kHz / 16-bit / mono raw PCM
+- `POST /api/v1/audio/tts`：JSON `{text, voice}`，返回 `audio/wav`
+
+音色白名单：
+
+```text
+zh_female_vv_uranus_bigtts
+saturn_zh_female_cancan_tob
+saturn_zh_female_keainvsheng_tob
+saturn_zh_female_tiaopigongzhu_tob
+saturn_zh_male_shuanglangshaonian_tob
+saturn_zh_male_tiancaitongzhuo_tob
+zh_female_xiaohe_uranus_bigtts
+zh_male_m191_uranus_bigtts
+zh_male_taocheng_uranus_bigtts
+en_male_tim_uranus_bigtts
+```
+
+- [x] **Step 16.4: 后端测试**
+
+`test_audio_api.py` 覆盖 voices、ASR 上传、空音频拒绝、TTS 指定 voice、unknown voice 422。
+
+---
+
+## Task 17: 5C iOS 远端音频重构
+
+**Files:**
+- Create: `client/ShoppingGuide/Networking/AudioService.swift`
+- Modify: `client/ShoppingGuide/Features/Chat/SpeechRecognitionService.swift`
+- Modify: `client/ShoppingGuide/Features/Chat/SpeechSynthesisService.swift`
+- Modify: `client/ShoppingGuide/Features/Chat/ChatView.swift`
+- Modify: `client/ShoppingGuide/Features/Chat/ChatViewModel.swift`
+- Test: `client/Tests/ShoppingGuideKitTests/ChatViewModelTests.swift`
+
+- [x] **Step 17.1: AudioService HTTP 客户端**
+
+新增：
+- `transcribe(pcm:) -> String`：multipart 上传 `/api/v1/audio/asr`
+- `synthesize(text:voice:) -> Data`：JSON 调 `/api/v1/audio/tts`
+
+- [x] **Step 17.2: ServerSpeechRecognitionService**
+
+iOS 主链路：
+- `AVAudioEngine` 采集麦克风
+- `AVAudioConverter` 转 16kHz / 16-bit / mono PCM
+- 手动停止录音后上传 ASR
+- ASR completion 回填 `inputText`
+- reset / send 会取消旧 voice turn，避免旧回调污染新会话
+
+降级：远端录音链路不可用时退回 `SpeechRecognitionService`（端侧 `SFSpeechRecognizer`）。若用户没有说话导致 ASR 返回空文本，前端只结束录音状态，不展示"ASR 返回空文本"提示。
+
+- [x] **Step 17.3: ServerSpeechSynthesisService**
+
+iOS 主链路：
+- 调 `/api/v1/audio/tts`
+- 用 `AVAudioPlayer(data:)` 播放后端返回 WAV
+- TTS 失败时停止本次播报，不退回本地 `AVSpeechSynthesizer`
+
+---
+
+## Task 18: 5C 音色选择
+
+**Files:**
+- Modify: `client/ShoppingGuide/Features/Chat/SpeechSynthesisService.swift`
+- Modify: `client/ShoppingGuide/Features/Chat/ChatView.swift`
+- Modify: `client/ShoppingGuide/Features/Chat/ChatViewModel.swift`
+- Test: `client/Tests/ShoppingGuideKitTests/ChatViewModelTests.swift`
+
+- [x] **Step 18.1: SpeechVoice 模型**
+
+`SpeechVoice` 定义 voice id、展示名、locale、gender，内置 10 个用户指定音色，默认 `saturn_zh_female_cancan_tob`。
+
+- [x] **Step 18.2: Header 音色菜单**
+
+`ChatView` Header 新增 `waveform.circle` 菜单，用户可选择 TTS 音色；菜单仅展示白名单音色。
+
+- [x] **Step 18.3: selectedVoice 透传**
+
+`ChatViewModel.selectedVoice` 传给 `speechSpeaker.speak(text, voice:)`；测试覆盖 `ttsUsesSelectedVoice()`。
+
+---
+
 ## 附录：异常处理快查表
 
 | 现象 | 第一步排查 |
@@ -2725,6 +3054,9 @@ Phase 5 是**纯增量**——所有 Phase 1-4 文件零回退。新增分支处
 | chat 拿到 image_id 但 retrieve 空 | 检查 `filter_expr` 拼接：用 `logger.info` 打 filter_expr 字符串看是否含 `chunk_type in ["image", "title"]` |
 | 同款检索 Top-1 ≠ 自身 | 99% 是 image chunk 没入库；跑 `python -m scripts.build_image_index --rebuild` |
 | iOS 气泡缩略图不显示 | `localImageURL` 写入临时目录后是否被系统清理；可改用 `FileManager.default.urls(for: .cachesDirectory, ...)` |
+| 麦克风按钮无反应 | 检查 `NSMicrophoneUsageDescription` / `NSSpeechRecognitionUsageDescription` 是否写入生成的 Info.plist |
+| Speech 权限已给但无法识别 | 检查设备/模拟器是否支持 `SFSpeechRecognizer(locale: "zh-CN")`，并查看 `voiceNotice` |
+| 新建会话后仍在播报 | 检查 `ChatViewModel.resetSession()` 是否调用 `speechSpeaker.stop()` |
 
 ---
 
@@ -2736,6 +3068,7 @@ Phase 5 是**纯增量**——所有 Phase 1-4 文件零回退。新增分支处
 2. 等待用户审阅 + 用户人工 commit
 3. 用户给出"下一步"指令后再进 Task N+1
 
-各 Task 间相互独立但有依赖顺序：Task 1 → 2 → 3 → 4 → 5 → 6 → 7（server 闭环）→ Task 8 → 9（iOS 闭环）→ Task 10（评测）→ Task 11（文档）。
+各 Task 间相互独立但有依赖顺序：Task 1 → 2 → 3 → 4 → 5 → 6 → 7（server 闭环）→ Task 8 → 9（iOS 图搜闭环）→ Task 10（评测）→ Task 11（文档）→ Task 12 → 13 → 14 → 15（5C 语音/TTS 闭环）。
 
 Task 1-7 完成即可 server smoke；Task 1-9 完成即可 iOS 端 e2e。
+Task 12-15 完成即可覆盖 5C 语音输入 / TTS 播报验收。

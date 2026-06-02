@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
+from app.api.audio import router as audio_router
 from app.api.chat import router as chat_router
 from app.api.products import router as products_router
 from app.api.upload import router as upload_router
@@ -78,6 +79,7 @@ else:
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(products_router, prefix="/api/v1")
 app.include_router(upload_router, prefix="/api/v1")
+app.include_router(audio_router, prefix="/api/v1")
 
 
 @app.get("/")

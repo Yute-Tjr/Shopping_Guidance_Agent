@@ -371,13 +371,12 @@ HStack {
 
 ### 6.1 语音输入（加分项 4.2 ⭐）
 
-`VoiceInputView`：按住录音，松手转文字后送入聊天。
+`VoiceInputView`：点击麦克风开始录音，再次点击停止；停止后上传服务端 ASR，转写文本写入输入框，由用户确认发送。
 
-- 用 `AVAudioRecorder` 录 16kHz / WAV / 单声道
-- ASR 两套方案：
-  1. **端侧**：`SFSpeechRecognizer(locale: zh-CN)` —— 不消耗后端额度，足够 demo
-  2. **后端**：上传音频到 `/asr`（如果后端接了方舟语音），更稳定
-- 转文字后直接走 `viewModel.send()`，**不需要新接口**
+- 用 `AVAudioEngine` + `AVAudioConverter` 录 16kHz / 16-bit / mono raw PCM
+- 主链路：`POST /api/v1/audio/asr`，后端通过豆包语音 OpenSpeech ASR `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel` 转写
+- 降级链路：如果远端录音/ASR 不可用，保留 `SFSpeechRecognizer(locale: zh-CN)`
+- 转文字后只写入 `inputText`，**不自动发送**，避免识别误差直接触发错误请求
 
 ### 6.2 相机 / 相册（加分项 4.2 ⭐⭐⭐）
 
@@ -399,17 +398,26 @@ PhotosPicker(selection: $selectedItem, matching: .images) { Image(systemName: "c
 
 ### 6.3 TTS（加分项 4.2 ⭐⭐）
 
-在 assistant 气泡右上角加 🔊 按钮：
+assistant 非 streaming 回复下方显示 speaker 按钮；Header 提供自动播报开关和音色菜单。
 
 ```swift
-let synthesizer = AVSpeechSynthesizer()
-func speak(_ text: String) {
-    let utt = AVSpeechUtterance(string: text)
-    utt.voice = AVSpeechSynthesisVoice(language: "zh-CN")
-    utt.rate = 0.5
-    synthesizer.speak(utt)
+struct SpeechVoice: Identifiable {
+    let id: String
+    let displayName: String
+    let locale: String
+}
+
+func speak(_ text: String, voice: SpeechVoice) async {
+    let wav = try await audioService.synthesize(text: text, voice: voice)
+    let player = try AVAudioPlayer(data: wav)
+    player.play()
 }
 ```
+
+- 主链路：`POST /api/v1/audio/tts`，后端通过豆包语音 OpenSpeech TTS `wss://openspeech.bytedance.com/api/v3/tts/bidirection` 合成
+- 返回：`audio/wav`，iOS 用 `AVAudioPlayer` 播放
+- 失败处理：远端 TTS 失败时停止本次播报，不走 `AVSpeechSynthesizer` 原生朗读
+- 音色：Header 菜单从 10 个内置 voice id 中选择，`ChatViewModel.selectedVoice` 透传给 TTS 请求
 
 ---
 

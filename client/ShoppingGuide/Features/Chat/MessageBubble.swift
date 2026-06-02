@@ -16,6 +16,7 @@ struct MessageBubble: View, Equatable {
     let message: ChatMessage
     var onSelectClarify: ((String) -> Void)? = nil
     var onSelectProduct: ((ProductCard) -> Void)? = nil
+    var onSpeakAssistant: ((String) -> Void)? = nil
 
     /// 配合 ChatView 调用处的 .equatable() 使用：父 view 因流式 token 推动反复重评估 body 时，
     /// SwiftUI 会重新 init 每一条 MessageBubble；不加 == 跳过的话每条历史消息每帧都重跑
@@ -32,6 +33,9 @@ struct MessageBubble: View, Equatable {
             // 避免长表格被气泡 minLength 限宽挤成竖排的"每字一行"。
             if message.role == .assistant {
                 assistantContent
+                if showsSpeakAction {
+                    speakActionRow
+                }
             } else {
                 bubbleRow
             }
@@ -45,6 +49,30 @@ struct MessageBubble: View, Equatable {
                 errorRow(notice)
             }
         }
+    }
+
+    private var showsSpeakAction: Bool {
+        message.role == .assistant &&
+        !message.isStreaming &&
+        onSpeakAssistant != nil &&
+        !message.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var speakActionRow: some View {
+        Button {
+            onSpeakAssistant?(message.text)
+        } label: {
+            Image(systemName: "speaker.wave.2.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Theme.Palette.brand)
+                .frame(width: 28, height: 28)
+                .background(Circle().fill(Theme.Palette.chipSoft))
+                .overlay(
+                    Circle().stroke(Theme.Palette.brand.opacity(0.22), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("播报回复")
     }
 
     // MARK: - Assistant content (split by markdown blocks)

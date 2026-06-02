@@ -46,6 +46,55 @@ final class ControlledChatTransport: ChatTransport, @unchecked Sendable {
     }
 }
 
+@MainActor
+final class FakeSpeechRecognizer: SpeechRecognizing, @unchecked Sendable {
+    var startCount = 0
+    var stopCount = 0
+    var startError: Error?
+    private var onPartialResult: (@MainActor @Sendable (String) -> Void)?
+    private var onCompletion: (@MainActor @Sendable (SpeechRecognitionError?) -> Void)?
+
+    func start(
+        onPartialResult: @escaping @MainActor @Sendable (String) -> Void,
+        onCompletion: @escaping @MainActor @Sendable (SpeechRecognitionError?) -> Void
+    ) async throws {
+        startCount += 1
+        if let startError {
+            throw startError
+        }
+        self.onPartialResult = onPartialResult
+        self.onCompletion = onCompletion
+    }
+
+    func stop() {
+        stopCount += 1
+    }
+
+    @MainActor
+    func emit(_ text: String) {
+        onPartialResult?(text)
+    }
+
+    @MainActor
+    func complete(_ error: SpeechRecognitionError? = nil) {
+        onCompletion?(error)
+    }
+}
+
+@MainActor
+final class FakeSpeechSpeaker: SpeechSpeaking, @unchecked Sendable {
+    var spokenItems: [(text: String, voice: SpeechVoice)] = []
+    var stopCount = 0
+
+    func speak(_ text: String, voice: SpeechVoice) {
+        spokenItems.append((text: text, voice: voice))
+    }
+
+    func stop() {
+        stopCount += 1
+    }
+}
+
 private func sampleCard(_ pid: String = "p_test") -> ProductCard {
     ProductCard(
         productId: pid,
@@ -178,6 +227,7 @@ struct ChatViewModelTests {
         vm.inputText = "推荐蓝牙耳机"
 
         let firstSend = Task { await vm.send() }
+        await Task.yield()
         await transport.waitForStreamCount(1)
         #expect(vm.isSending == true)
 
@@ -199,6 +249,7 @@ struct ChatViewModelTests {
 
         vm.inputText = "新会话可以发送"
         let secondSend = Task { await vm.send() }
+        await Task.yield()
         await transport.waitForStreamCount(2)
         transport.yield(.token(text: "新回复"), to: 1)
         transport.yield(.done, to: 1)
@@ -231,5 +282,161 @@ struct ChatViewModelTests {
         vm2.inputText = "再来一条问题"
         await vm2.send()
         #expect(vm2.sessionID == "sess-keep")
+    }
+
+    @Test func voiceInputPartialTranscriptUpdatesInputText() async {
+        let recognizer = FakeSpeechRecognizer()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechRecognizer: recognizer
+        )
+
+        await vm.startVoiceInput()
+        recognizer.emit("推荐蓝牙耳机")
+
+        #expect(vm.isListening == true)
+        #expect(vm.inputText == "推荐蓝牙耳机")
+
+        vm.stopVoiceInput()
+        #expect(vm.isListening == false)
+        #expect(recognizer.stopCount == 1)
+    }
+
+    @Test func voiceInputFailureSetsNoticeAndStopsListening() async {
+        let recognizer = FakeSpeechRecognizer()
+        recognizer.startError = SpeechRecognitionError.permissionDenied
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechRecognizer: recognizer
+        )
+
+        await vm.startVoiceInput()
+
+        #expect(vm.isListening == false)
+        #expect(vm.voiceNotice?.contains("语音识别权限") == true)
+    }
+
+    @Test func manualStopAllowsRemoteAsrCompletionToUpdateInput() async {
+        let recognizer = FakeSpeechRecognizer()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechRecognizer: recognizer
+        )
+
+        await vm.startVoiceInput()
+        vm.stopVoiceInput()
+        recognizer.emit("推荐蓝牙耳机")
+        recognizer.complete()
+
+        #expect(vm.isListening == false)
+        #expect(vm.inputText == "推荐蓝牙耳机")
+    }
+
+    @Test func voiceInputCompletionStopsListening() async {
+        let recognizer = FakeSpeechRecognizer()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechRecognizer: recognizer
+        )
+
+        await vm.startVoiceInput()
+        recognizer.complete()
+
+        #expect(vm.isListening == false)
+        #expect(vm.voiceNotice == nil)
+    }
+
+    @Test func emptyAsrTextCompletionDoesNotShowNotice() async {
+        let recognizer = FakeSpeechRecognizer()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechRecognizer: recognizer
+        )
+
+        await vm.startVoiceInput()
+        recognizer.complete(.recognitionFailed(message: "ASR 返回空文本"))
+
+        #expect(vm.isListening == false)
+        #expect(vm.voiceNotice == nil)
+        #expect(vm.inputText == "")
+    }
+
+    @Test func staleVoiceCompletionAfterResetDoesNotMutateNewSession() async {
+        let recognizer = FakeSpeechRecognizer()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechRecognizer: recognizer
+        )
+
+        await vm.startVoiceInput()
+        vm.resetSession()
+        recognizer.complete(.recognitionFailed(message: "旧语音错误"))
+
+        #expect(vm.isListening == false)
+        #expect(vm.voiceNotice == nil)
+        #expect(vm.inputText == "")
+    }
+
+    @Test func sendStopsActiveVoiceInputBeforeStreaming() async {
+        let recognizer = FakeSpeechRecognizer()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: [.token(text: "好的"), .done]),
+            speechRecognizer: recognizer
+        )
+
+        await vm.startVoiceInput()
+        recognizer.emit("推荐手机")
+        await vm.send()
+
+        #expect(recognizer.stopCount == 1)
+        #expect(vm.isListening == false)
+        #expect(vm.messages.last?.text == "好的")
+    }
+
+    @Test func resetSessionStopsVoiceAndSpeechOutput() async {
+        let recognizer = FakeSpeechRecognizer()
+        let speaker = FakeSpeechSpeaker()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechRecognizer: recognizer,
+            speechSpeaker: speaker
+        )
+
+        await vm.startVoiceInput()
+        vm.speakAssistantText("正在播报的旧回复")
+        vm.resetSession()
+
+        #expect(recognizer.stopCount == 1)
+        #expect(speaker.stopCount == 1)
+        #expect(vm.isListening == false)
+    }
+
+    @Test func autoSpeakReadsAssistantReplyAfterDone() async {
+        let speaker = FakeSpeechSpeaker()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: [.token(text: "为你推荐"), .done]),
+            speechSpeaker: speaker
+        )
+        vm.autoSpeakEnabled = true
+        vm.inputText = "推荐一款洗面奶"
+
+        await vm.send()
+
+        #expect(speaker.spokenItems.map(\.text) == ["为你推荐"])
+        #expect(speaker.spokenItems.map(\.voice) == [.default])
+    }
+
+    @Test func ttsUsesSelectedVoice() async {
+        let speaker = FakeSpeechSpeaker()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechSpeaker: speaker
+        )
+        vm.selectedVoice = SpeechVoice.all.first { $0.id == "saturn_zh_male_shuanglangshaonian_tob" }!
+
+        vm.speakAssistantText("请听这段回复")
+
+        #expect(speaker.spokenItems.map(\.text) == ["请听这段回复"])
+        #expect(speaker.spokenItems.map(\.voice) == [vm.selectedVoice])
     }
 }
