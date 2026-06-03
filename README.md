@@ -54,8 +54,9 @@ curl http://127.0.0.1:8000/healthz
 
 ```bash
 cd ./client
-# 用 Xcode 打开 ShoppingGuide.xcodeproj（Phase 0 暂未生成 Xcode 工程文件，
-# 请按 client/README.md 在本机新建 SwiftUI 工程后把 ShoppingGuide/ 下源码加入）。
+open ShoppingGuide.xcodeproj
+# 在 Xcode 中选择 ShoppingGuide scheme，启动 iOS Simulator。
+# 默认后端地址见 AppEnvironment，可在本机 demo 时保持 http://127.0.0.1:8000。
 ```
 
 ---
@@ -71,8 +72,8 @@ cd ./client
   - [x] 子项 2：多商品对比（CompareTargetExtractor + 并行检索 + GFM 表格 Prompt）([详情](#phase-4-2-多商品对比))
   - [x] 子项 3：主动澄清（ClarifyDetector + 13 类目 chips 模板）([详情](#phase-4-3-主动澄清))
   - [x] 子项 4：多轮 memory 摘要压缩（MemorySummarizer + summary 注入 prompt）([详情](#phase-4-4-多轮-memory-摘要压缩))
-- [~] **Phase 5**：多模态图搜（拍照找货）—— server + iOS 代码闭环，待真实灌图索引 + 评测 / 模拟器手动验收 ([详情](#phase-5-多模态图搜)，[设计文档](docs/05_多模态设计)，[执行计划](docs/phase5_implementation_plan.md))
-- [ ] Phase 6：打磨与交付
+- [x] **Phase 5**：多模态交互（拍照找货 + ASR 语音输入 + TTS 播报）([详情](#phase-5-多模态交互)，[设计文档](docs/05_多模态设计.md)，[执行计划](docs/phase5_implementation_plan.md)，[评测报告](docs/phase5_eval_report.md))
+- [ ] **Phase 6**：前端体验打磨与交付规划 ([设计文档](docs/06_前端体验优化设计.md))
 
 ---
 
@@ -823,11 +824,11 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 
 ---
 
-## Phase 5 多模态图搜
+## Phase 5 多模态交互
 
-> 详细设计 [`docs/05_多模态图搜设计.md`](docs/05_多模态设计)；执行计划 [`docs/phase5_implementation_plan.md`](docs/phase5_implementation_plan.md)。
+> 详细设计 [`docs/05_多模态设计.md`](docs/05_多模态设计.md)；执行计划 [`docs/phase5_implementation_plan.md`](docs/phase5_implementation_plan.md)；图搜评测 [`docs/phase5_eval_report.md`](docs/phase5_eval_report.md)。
 
-在 Phase 4 对话能力之上叠加**多模态输入路径**：iOS 端拍照/选图 + 可选文字 → 二段式上传 → vision embedding 检索 + Phase 4 结构化筛选融合 → 商品推荐流。Task 1-7 = server 侧闭环，Task 8-9 = iOS 闭环，Task 10 = 黄金集评测，Task 11 = 文档收尾。
+在 Phase 4 对话能力之上叠加**图片 + 语音**两条交互路径：iOS 端拍照/选图 + 可选文字 → 二段式上传 → vision embedding 检索 + Phase 4 结构化筛选融合 → 商品推荐流；语音输入走 iOS 录音 → 服务端豆包 OpenSpeech ASR → 回填输入框；AI 回复走服务端 TTS → WAV 播放，可手动播报或开启自动播报。
 
 ### (a) 核心设计抉择
 
@@ -837,6 +838,9 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 4. **图文矛盾**：retrieve 层不做仲裁；Prompt 加规则「用户文字与图明显矛盾时以文字为准」由 LLM 处理。
 5. **任意一环失败可退化**：vision API 限流 / 落盘图丢失 / Milvus 空结果 → 全部能退化到纯文本流，绝不出现「上传图后对话卡死」。
 6. **Phase 1-4 零回退**：Phase 5 是纯增量，新增分支处理器 `MultimodalBranch` 与 `clarify_detector` / `compare_planner` 同层级；orchestrator 入口按 `image_id` 是否非空决定走 Phase 4 还是 Phase 5 路径；纯文本对话体验完全不变。
+7. **语音是独立音频网关**：ASR/TTS 不进入 RAG 编排层。`/audio/asr` 只负责把 PCM 转文本，`/audio/tts` 只负责把 assistant 文本合成 WAV；识别后的文本继续复用原 `/chat` 链路。
+8. **TTS 只保留服务端合成**：取消 `AVSpeechSynthesizer` 原生朗读模式，避免本地音色和服务端音色不一致。用户可在 Header 菜单选择 10 个白名单 voice id。
+9. **朗读体验优化**：首次朗读展示“正在准备朗读...”状态；同一文本 + 音色命中前端内存缓存后直接播放，不再显示准备提示。
 
 ### (b) 模块分层
 
@@ -850,7 +854,10 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 | [`server/app/agent/multimodal_branch.py`](server/app/agent/multimodal_branch.py) | **新增**。`MultimodalBranch.handle(message, image_id, history, summary)` → 缓存命中即取 vec / miss 时走 `_resolve_path` + `embed_multimodal` 重算并回填，落盘图丢失自动退化纯文本（`image_lost=True`）。`filter_expr` = `query_rewriter` 结构化条件 AND `chunk_type in ['image','title']`，绕过 `RagRetriever.search` 的 embed 步骤直查底层 `store.search` 复用 `_aggregate` |
 | [`server/app/agent/orchestrator.py`](server/app/agent/orchestrator.py) | **修改**。`__init__` 加 `multimodal_branch` 参数（缺省 None 时 Phase 5 路径全关）；`orchestrate` 入口加 image_id 分流——非空且 branch 注入则短路 intent 判定，调用 `_multimodal_orchestrate` 走图文流。该子方法把 `MultimodalBranch.handle` 返回的 retrieved 喂给 `build_image_search_messages` → LLM 流 → `ProductCardExtractor` → `_hydrate_card`，**LLM 异常时复用 Phase 2 的 Top-K 兜底链路** |
 | [`server/app/api/deps.py`](server/app/api/deps.py) | **修改**。`get_image_embed_cache` / `get_upload_dir` / `get_multimodal_branch` 三个新工厂；`get_orchestrator` 装配时注入 `multimodal_branch=get_multimodal_branch()` |
-| [`server/app/main.py`](server/app/main.py) | **修改**。注册 `upload_router` 在 `/api/v1` 前缀下 |
+| [`server/app/api/audio.py`](server/app/api/audio.py) | **新增**。`GET /api/v1/audio/voices`、`POST /api/v1/audio/asr`、`POST /api/v1/audio/tts` 三个音频端点；校验音频大小、MIME 与 voice 白名单 |
+| [`server/app/audio/ark_audio_client.py`](server/app/audio/ark_audio_client.py) | **新增**。封装火山方舟 / 豆包 OpenSpeech ASR 与 TTS WebSocket 协议；ASR 输入 16k PCM，TTS 输出 WAV |
+| [`server/app/config.py`](server/app/config.py) | **修改**。新增 `ARK_AUDIO_API_KEY`、`ARK_ASR_MODEL`、`ARK_TTS_MODEL`、`ARK_ASR_RESOURCE_ID`、`ARK_TTS_RESOURCE_ID`、`ARK_TTS_DEFAULT_VOICE` 等配置 |
+| [`server/app/main.py`](server/app/main.py) | **修改**。注册 upload router 与 audio router 到 `/api/v1` 前缀下 |
 
 ### (c) 数据流（典型一轮图文对话）
 
@@ -885,7 +892,32 @@ POST /api/v1/chat/stream { "message":"找类似的，1000 以下", "image_id":"<
    ▼ memory.save_turn → done
 ```
 
-### (d) 失败路径与降级（设计原则：任何一环挂都不能让对话卡死）
+### (d) 语音输入与 TTS 数据流
+
+```
+[iOS] 麦克风按钮
+   │
+   ├─ AVAudioEngine 录音，转换为 16kHz / 16-bit / mono PCM
+   ▼
+POST /api/v1/audio/asr (multipart)
+   │
+   ├─ 后端 OpenSpeech ASR WebSocket
+   ▼
+{ "text": "推荐 200 元以下蓝牙耳机" }
+   │
+   └─ ChatViewModel.inputText = text，用户确认后仍走原 chat/RAG 链路
+
+[iOS] assistant 回复完成后点击播报 / 自动播报
+   │
+   ├─ 若同文本 + 同音色已有本地音频缓存：直接 AVAudioPlayer 播放
+   └─ 若未缓存：显示“正在准备朗读...”
+       ▼
+POST /api/v1/audio/tts { "text": "...", "voice": "saturn_zh_female_cancan_tob" }
+       │
+       └─ 后端 OpenSpeech TTS → audio/wav → iOS 播放并写入内存缓存
+```
+
+### (e) 失败路径与降级（设计原则：任何一环挂都不能让对话卡死）
 
 | 失败点 | 处理 |
 | --- | --- |
@@ -894,8 +926,10 @@ POST /api/v1/chat/stream { "message":"找类似的，1000 以下", "image_id":"<
 | `query_rewriter` LLM 异常 | 按 identity ParsedQuery 兜底，filter 只剩 `chunk_type in ['image','title']` |
 | Milvus 命中空 | 走 Phase 2 已有的"未找到匹配商品"话术，**不**输出 product_cards 围栏 |
 | LLM 流式异常 | 复用 Phase 2 降级链路：emit `error` event + Top-K retrieved 直接 hydrate 成卡片兜底 |
+| ASR 返回空文本 | 前端不显示“ASR 返回空文本”，只保持输入框为空，避免把内部错误暴露给用户 |
+| TTS 合成失败 | 停止本次播报，不回退原生朗读；下一次点击仍可重试 |
 
-### (e) iOS 端模块（Task 8-9）
+### (f) iOS 端模块
 
 | 文件 | 作用 |
 | --- | --- |
@@ -904,14 +938,17 @@ POST /api/v1/chat/stream { "message":"找类似的，1000 以下", "image_id":"<
 | [`client/ShoppingGuide/Features/Chat/ImagePicker.swift`](client/ShoppingGuide/Features/Chat/ImagePicker.swift) | **新增**。`PhotosPicker` 封装 + `loadAndCompress`：短边 ≤ 1600 + JPEG 质量逐级降直到 ≤ 1 MB，对齐后端 `_MAX_BYTES`；输出 `PickedImage(data, localURL)` 写到 `FileManager.default.temporaryDirectory` |
 | [`client/ShoppingGuide/Networking/UploadService.swift`](client/ShoppingGuide/Networking/UploadService.swift) | **新增**。`POST /api/v1/upload/image` multipart 客户端。区分三种错误：`.invalidResponse` / `.server(status, message)` / `.degraded(message)` —— 503 + `fallback_text_only` 解析后抛 `.degraded`，让 VM 走"保留缩略图但只发文字"的降级路径 |
 | [`client/ShoppingGuide/Features/Chat/ChatTransport.swift`](client/ShoppingGuide/Features/Chat/ChatTransport.swift) | **修改**。protocol `stream(message:sessionID:imageID:)` 加 imageID 参数；extension 给旧 2 参形态保留默认 nil 兜底，FakeChatTransport / 历史调用点零回退 |
-| [`client/ShoppingGuide/Features/Chat/ChatViewModel.swift`](client/ShoppingGuide/Features/Chat/ChatViewModel.swift) | **修改**。注入 `UploadService` + `@Published pickedImage / uploadNotice`；`send()` 重构成 "上传 → 拿 image_id → 流式" 编排，含 503 降级路径（保留缩略图但只发文字）和其它错误把 notice 挂到 assistant 气泡中断本轮 |
+| [`client/ShoppingGuide/Features/Chat/ChatViewModel.swift`](client/ShoppingGuide/Features/Chat/ChatViewModel.swift) | **修改**。注入 `UploadService` + `@Published pickedImage / uploadNotice`；`send()` 重构成 "上传 → 拿 image_id → 流式" 编排；管理 `isListening`、`voiceNotice`、`speechNotice`、`autoSpeakEnabled`、`selectedVoice`；重置会话时停止录音和播报 |
 | [`client/ShoppingGuide/Features/Chat/ChatView.swift`](client/ShoppingGuide/Features/Chat/ChatView.swift) | **修改**。`init` 注入 `UploadService(baseURL: env.baseURL)`；输入栏左侧加 `ImagePicker` 相机按钮；输入栏上方加缩略图条 + 关闭按钮 + 错误提示条；`canSend` 逻辑改为「文本非空 **或** 已选图」 |
 | [`client/ShoppingGuide/Features/Chat/MessageBubble.swift`](client/ShoppingGuide/Features/Chat/MessageBubble.swift) | **修改**。用户气泡顶部嵌 `localImageURL` 加载的缩略图（最大 200×200，`Theme.Radius.chip` 圆角），与现有 user/assistant 气泡渲染保持视觉一致 |
+| [`client/ShoppingGuide/Networking/AudioService.swift`](client/ShoppingGuide/Networking/AudioService.swift) | **新增**。ASR/TTS HTTP 客户端，上传 PCM、请求 WAV、拉取 voice 列表 |
+| [`client/ShoppingGuide/Features/Chat/SpeechRecognitionService.swift`](client/ShoppingGuide/Features/Chat/SpeechRecognitionService.swift) | **新增**。服务端 ASR 主链路；发送 / 新建会话时让旧识别回调失效 |
+| [`client/ShoppingGuide/Features/Chat/SpeechSynthesisService.swift`](client/ShoppingGuide/Features/Chat/SpeechSynthesisService.swift) | **新增**。服务端 TTS 播放、10 个音色定义、同文本 + 音色内存缓存 |
 | [`client/Package.swift`](client/Package.swift) | **修改**。`Features/Chat/ImagePicker.swift` 加进 SPM exclude（macOS 测试目标不含 UIKit/PhotosUI） |
 
 iOS 端额外验证（Step 9.4-9.5）：选图 → 缩略图条出现 → 发送 → 用户气泡上嵌缩略图 → 服务端 `upload 成功：image_id=...` → SSE 流回卡片；同款命中验证：把 `p_clothes_007_live.jpg` 放进模拟器相册，文字「找同款」→ Top-1 卡片 product_id == `p_clothes_007`。
 
-### (f) 测试覆盖
+### (g) 测试覆盖
 
 **Server 侧新增 26 条单测**：
 
@@ -923,39 +960,33 @@ iOS 端额外验证（Step 9.4-9.5）：选图 → 缩略图条出现 → 发送
 | `tests/test_prompts.py` | +2 | `build_image_search_messages` 含"图文矛盾"/"以文字为准"规则 / image_path 不泄漏到 system prompt / 复用 retrieved_products 块 |
 | `tests/test_multimodal_branch.py` | 5 | 缓存命中走旧 vec / miss 时 fallback resolver 重算 / filter_expr 自动叠 chunk_type / 结构化 filter AND chunk_type / 落盘图丢失退化纯文本 |
 | `tests/test_orchestrator.py` | +1 | image_id 非空 → MultimodalBranch.handle 被调用 / image_id 为空 → 不触达 |
+| `tests/test_audio_api.py` | 4 | voices / ASR / TTS / unknown voice |
 
-**全套 server 测试：178 (Phase 4 baseline) + 26 (Phase 5) = 204 passed**。
+**全套 server 测试：覆盖 Phase 1-5 的检索、编排、上传、音频 API 与降级路径。**
 
-**iOS 端**：`xcodebuild -destination 'platform=iOS Simulator,name=iPhone 17' build` → **BUILD SUCCEEDED**。Step 9.4-9.5 模拟器 e2e（拍照 / 选商品自身图同款命中）属手动验收。
+**iOS 端**：已覆盖商品导航、ViewModel 状态重置、语音输入、TTS 准备态与缓存命中逻辑；Xcode 工程构建通过。
 
-### (g) 评测黄金集（Task 10）
+### (h) 评测黄金集
 
 `server/scripts/eval/image_queries.json` 共 **15 条 case**，按 4 类拆分：
 
-| 类型 | n | 验证点 |
-| --- | --- | --- |
-| `same_item` | 4 | 上传数据集内某商品的 `_live.jpg`，Top-1 应命中自身（向量空间对自身的还原能力） |
-| `similar` | 5 | 上传 + 文字「类似的 X」，Top-3 应覆盖同 sub_category 的其它候选（跑鞋 / 精华 / 智能手机 / 咖啡 / 篮球鞋） |
-| `image_plus_price` | 3 | 上传 + 「≤ X 元的 Y」，Top-3 应只剩同品类 + 价格区间内的候选；验证 query_rewriter 抽 `price_max` 后 filter_expr 与 chunk_type 双重 AND |
-| `image_plus_brand_exclude` | 3 | 上传 + 「不要 X 品牌的」，Top-3 应排除上传图自身品牌；验证 `brands_exclude` 在多模态分支生效 |
+| 类型 | n | Top-1 | Top-3 | Top-5 |
+| --- | --- | --- | --- | --- |
+| `same_item` | 4 | 100.0% | 100.0% | 100.0% |
+| `similar` | 5 | 100.0% | 100.0% | 100.0% |
+| `image_plus_price` | 3 | 100.0% | 100.0% | 100.0% |
+| `image_plus_brand_exclude` | 3 | 66.7% | 100.0% | 100.0% |
 
-`server/scripts/eval_image_search.py` 跑 Top-1/3/5 指标输出到 `docs/phase5_eval_report.md`；`server/scripts/smoke_image_chat.sh` 跑端到端冒烟（upload → chat），全部用真实 `p_clothes_007_live.jpg` (Nike Pegasus 41) 作默认图。
+结论：四类 Top-3 / Top-5 全部 100%，已对齐文档 05 的达标线；`image_plus_brand_exclude` Top-1 仍有 1 条 case 命中第三位，属于 Top-1 排序质量的后续优化空间。
 
-### (h) 待跑（手动操作）
+`server/scripts/eval_image_search.py` 输出指标到 `docs/phase5_eval_report.md`；`server/scripts/smoke_image_chat.sh` 跑端到端冒烟（upload → chat），默认用真实 `p_clothes_007_live.jpg` (Nike Pegasus 41)。
 
-| 步骤 | 命令 | 依赖 |
-| --- | --- | --- |
-| 灌图索引 | `python -m scripts.build_image_index --rebuild` | Doubao vision API 配额（100 张图 × ~600-1200ms） |
-| 跑黄金集评测 | `python -m scripts.eval_image_search --output ../docs/phase5_eval_report.md` | 灌图完成 + vision API 可用 |
-| 起服务跑 smoke | `uvicorn app.main:app & bash scripts/smoke_image_chat.sh` | 灌图完成 |
-| iOS 模拟器 e2e | 在 Xcode 启动 iPhone 17 模拟器 → 把 `p_clothes_007_live.jpg` 拖进相册 → 选图 + 「找同款」→ Top-1 卡片 == `p_clothes_007` | 服务起着 + Phase 5 索引就位 |
-
-### Phase 5 复跑指令
+### (i) 常用复跑指令
 
 ```bash
 cd server && source .venv/bin/activate
 
-# 1. 单测（server 侧 204 全过，含 Phase 5 新增 26）
+# 1. 单测
 python -m pytest tests/ -q
 
 # 2. 图索引灌入（消耗 vision API 配额，100 张图约 1-2 分钟）
@@ -969,14 +1000,38 @@ python -m scripts.eval_image_search --output ../docs/phase5_eval_report.md
 uvicorn app.main:app --host 127.0.0.1 --port 8000 &
 bash scripts/smoke_image_chat.sh   # 默认上传 p_clothes_007，message="找同款"
 
-# 5. iOS 端
+# 5. 音频接口冒烟
+curl http://127.0.0.1:8000/api/v1/audio/voices
+
+# 6. iOS 端构建
 cd ../client
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   xcodebuild -project ShoppingGuide.xcodeproj -scheme ShoppingGuide \
-  -destination 'platform=iOS Simulator,name=iPhone 17' build
+  -destination 'generic/platform=iOS Simulator' \
+  -derivedDataPath /private/tmp/ShoppingGuideDerivedData \
+  CODE_SIGNING_ALLOWED=NO build
 # Xcode 启动模拟器 → 把 ecommerce_agent_dataset 里某商品 _live.jpg
-# 拖进模拟器照片库 → app 内点相机按钮选图 → 发送 "找同款"
+# 拖进模拟器照片库 → app 内点相机按钮选图 → 发送 "找同款"；
+# 语音链路可测试：录音回填输入框、点击 assistant 播报、切换 Header 音色。
 ```
+
+---
+
+## Phase 6 前端体验优化
+
+> 设计开发文档：[`docs/06_前端体验优化设计.md`](docs/06_前端体验优化设计.md)。
+
+Phase 6 不改变 Phase 1-5 的后端能力，重点打磨 iOS App 的界面质感和交互反馈。方向是 **Calm Commerce Desk**：像真实购物决策工具，而不是营销页或泛 AI 应用。
+
+核心约束：
+
+1. **减少 AI 感**：不使用发光背景、渐变光斑、bokeh、装饰 orb。
+2. **减少圆角卡片堆叠**：普通容器圆角控制在 8pt 左右，图标按钮可保留圆形。
+3. **提高信息密度**：商品推荐从“营销卡片”改为“信息型商品行”，价格、规格、理由更便于扫描。
+4. **统一状态反馈**：上传、录音、识别、生成、TTS 准备与缓存播放使用一致的 inline 状态语言。
+5. **动效克制**：消息插入、商品点击、image shelf、录音 waveform 等只做 120-220ms 轻动效，并支持 Reduce Motion。
+
+计划分四步落地：Theme 收敛 → Chat 主界面 → 消息 / 商品 / 详情页 → 动效与验收。最终仍以 `git diff --check`、Xcode build、四类前端手动测试场景作为验收门槛。
 
 ---
 
