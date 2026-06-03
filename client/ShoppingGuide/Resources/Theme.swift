@@ -5,38 +5,42 @@ import SwiftUI
 /// 命名与 Figma 等设计稿同步：所有视图引用 Theme.color.xxx / Theme.radius.xxx，
 /// 不允许在视图里硬编码十六进制或具体字号；统一改主题色只动这一个文件。
 ///
-/// 设计风格：致敬 Coupert，暖橙主色 + 浅橙白底 + 价格高对比红 + 省钱绿。
+/// 设计风格：贴合 PriceCat 图标，鼠尾草绿底 + 黑猫墨色 + 眼睛黄绿 + 麦克风信号绿。
 enum Theme {
 
     // MARK: - Colors
 
     enum Palette {
-        /// 品牌橙 #FF6B00：CTA 按钮 / brand icon / 重要 chip
-        static let brand = Color(hex: 0xFF6B00)
-        /// 浅橙 #FF8533：hover、被按下、第二层强调
-        static let brandSoft = Color(hex: 0xFF8533)
-        /// 价格红 #FF3D00：商品现价、限时角标
-        static let priceHot = Color(hex: 0xFF3D00)
-        /// 省钱绿 #00B86B：saved badge、价格下降提示
-        static let savingsGreen = Color(hex: 0x00B86B)
+        /// 黑猫墨色：CTA / 用户气泡 / 高优先级图标
+        static let brand = Color(hex: 0x171A19)
+        /// 耳机炭灰：二级强调与渐变过渡
+        static let brandSoft = Color(hex: 0x3F4346)
+        /// 猫眼黄绿：选中态、音色入口、轻量强调
+        static let highlight = Color(hex: 0xC9CC68)
+        /// 暖铜红：商品现价、错误提示
+        static let priceHot = Color(hex: 0xB85B42)
+        /// 麦克风信号绿：saved badge、录音/可用状态
+        static let savingsGreen = Color(hex: 0x1FD86A)
 
-        /// 整页背景 #FFF8F2 浅橙白
-        static let canvas = Color(hex: 0xFFF8F2)
-        /// 卡片底白
-        static let surface = Color.white
+        /// 整页背景：从图标墙面抽出的浅鼠尾草绿
+        static let canvas = Color(hex: 0xE7EFE2)
+        /// 卡片底：略带暖度的白
+        static let surface = Color(hex: 0xFBFCF8)
         /// 浅边框 / divider
-        static let border = Color(hex: 0xF0E6DC)
-        /// chip 浅橙底 #FFF1E5
-        static let chipSoft = Color(hex: 0xFFF1E5)
+        static let border = Color(hex: 0xC9D4C4)
+        /// chip 浅绿底
+        static let chipSoft = Color(hex: 0xF0F6EA)
+        /// 输入栏 / 表格浅底
+        static let surfaceTint = Color(hex: 0xDCE8D5)
 
         /// 主文字
-        static let textPrimary = Color(hex: 0x1F1A17)
+        static let textPrimary = Color(hex: 0x151816)
         /// 次文字
-        static let textSecondary = Color(hex: 0x8A7E73)
+        static let textSecondary = Color(hex: 0x657165)
         /// 占位文字
-        static let textPlaceholder = Color(hex: 0xC7BBB0)
-        /// 用户气泡上的白文字
-        static let onBrand = Color.white
+        static let textPlaceholder = Color(hex: 0x9CAB98)
+        /// 用户气泡上的浅色文字
+        static let onBrand = Color(hex: 0xF8FAF2)
     }
 
     // MARK: - Typography
@@ -88,10 +92,10 @@ enum Theme {
     }
 
     enum Shadow {
-        /// 轻量卡片阴影：底 / 上浮 1pt
-        static let card = ShadowStyle(color: .black.opacity(0.05), radius: 8, x: 0, y: 2)
+        /// 轻量卡片阴影：低对比、贴近油画图标的柔和质感
+        static let card = ShadowStyle(color: Palette.brand.opacity(0.08), radius: 10, x: 0, y: 3)
         /// 浮起按钮
-        static let lifted = ShadowStyle(color: Palette.brand.opacity(0.25), radius: 12, x: 0, y: 6)
+        static let lifted = ShadowStyle(color: Palette.brand.opacity(0.22), radius: 14, x: 0, y: 7)
     }
 
     struct ShadowStyle {

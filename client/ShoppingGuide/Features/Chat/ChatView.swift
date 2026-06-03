@@ -1,10 +1,10 @@
 import PhotosUI
 import SwiftUI
 
-/// PriceCat 聊天主页：自绘品牌头 + 消息流 + 暖色输入栏。
+/// PriceCat 聊天主页：图标品牌头 + 消息流 + 鼠尾草绿输入栏。
 ///
-/// 不用 NavigationBar 自带 title（视觉太单薄）。顶部一行品牌头 = 渐变橙猫脸图标
-/// + "PriceCat" 重字 wordmark + 副标"AI 比价导购"，右侧"新建会话"按钮，整行下方
+/// 不用 NavigationBar 自带 title（视觉太单薄）。顶部一行品牌头 = PriceCat icon
+/// + "PriceCat" 重字 wordmark + 副标，右侧"新建会话"按钮，整行下方
 /// 用浅边线收尾。空状态居中放一组可点击的 starter chips，给用户具体可问的范例。
 struct ChatView: View {
     @EnvironmentObject private var env: AppEnvironment
@@ -94,86 +94,51 @@ struct ChatView: View {
 
     private var brandHeader: some View {
         HStack(spacing: Theme.Spacing.m) {
-            ZStack {
-                Circle()
-                    .fill(
-                        LinearGradient(
-                            colors: [Theme.Palette.brand, Theme.Palette.brandSoft],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(width: 38, height: 38)
-                Image(systemName: "cat.fill")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundStyle(.white)
-            }
+            Image("PriceCatIcon")
+                .resizable()
+                .scaledToFill()
+                .frame(width: 42, height: 42)
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Theme.Palette.surface.opacity(0.9), lineWidth: 1)
+                )
             .themeShadow(Theme.Shadow.lifted)
 
-            VStack(alignment: .leading, spacing: 0) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text("PriceCat")
                     .font(Theme.Typo.brandWordmark)
                     .foregroundStyle(Theme.Palette.textPrimary)
-                    .tracking(0.5)
-                Text("a daily companion for considered buying")
+                Text("image, voice, and real-listing advice")
                     .font(Theme.Typo.caption().italic())
                     .foregroundStyle(Theme.Palette.textSecondary)
             }
 
             Spacer()
 
-            Menu {
-                ForEach(SpeechVoice.all) { voice in
-                    Button {
-                        viewModel.selectedVoice = voice
-                    } label: {
-                        Label(
-                            voice.displayName,
-                            systemImage: viewModel.selectedVoice == voice ? "checkmark" : "waveform"
-                        )
-                    }
-                }
-            } label: {
-                Image(systemName: "waveform.circle")
-                    .font(.system(size: 20))
-                    .foregroundStyle(Theme.Palette.brand)
-                    .frame(width: 34, height: 34)
-                    .background(Circle().fill(Theme.Palette.chipSoft))
-            }
-            .accessibilityLabel("选择播报音色")
-
-            Button {
-                viewModel.autoSpeakEnabled.toggle()
-                if !viewModel.autoSpeakEnabled {
-                    viewModel.stopSpeaking()
-                }
-            } label: {
-                Image(systemName: viewModel.autoSpeakEnabled
-                      ? "speaker.wave.2.circle.fill"
-                      : "speaker.wave.2.circle")
-                    .font(.system(size: 20))
-                    .foregroundStyle(Theme.Palette.brand)
-                    .frame(width: 34, height: 34)
-                    .background(Circle().fill(Theme.Palette.chipSoft))
-            }
-            .accessibilityLabel(viewModel.autoSpeakEnabled ? "关闭自动播报" : "开启自动播报")
-
             Button {
                 viewModel.resetSession()
             } label: {
                 Image(systemName: "plus.bubble.fill")
                     .font(.system(size: 18))
-                    .foregroundStyle(Theme.Palette.brand)
-                    .padding(8)
+                    .foregroundStyle(Theme.Palette.onBrand)
+                    .frame(width: 36, height: 36)
                     .background(
-                        Circle().fill(Theme.Palette.chipSoft)
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Theme.Palette.brand)
                     )
             }
             .accessibilityLabel("新建会话")
         }
         .padding(.horizontal, Theme.Spacing.l)
         .padding(.vertical, Theme.Spacing.m)
-        .background(Theme.Palette.canvas)
+        .background(
+            LinearGradient(
+                colors: [Theme.Palette.canvas, Theme.Palette.chipSoft],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
     }
 
     // MARK: - Message list
@@ -207,6 +172,10 @@ struct ChatView: View {
                         },
                         onSelectProduct: { card in
                             productNavigation.select(productID: card.productId)
+                        },
+                        selectedVoice: viewModel.selectedVoice,
+                        onSelectVoice: { voice in
+                            viewModel.selectedVoice = voice
                         },
                         onSpeakAssistant: { text in
                             viewModel.speakAssistantText(text)
@@ -274,20 +243,16 @@ struct ChatView: View {
 
     private var emptyState: some View {
         VStack(spacing: Theme.Spacing.l) {
-            ZStack {
-                Circle()
-                    .fill(Theme.Palette.chipSoft)
-                    .frame(width: 96, height: 96)
-                Image(systemName: "cat.fill")
-                    .font(.system(size: 44, weight: .bold))
-                    .foregroundStyle(
-                        LinearGradient(
-                            colors: [Theme.Palette.brand, Theme.Palette.brandSoft],
-                            startPoint: .top,
-                            endPoint: .bottom
-                        )
-                    )
-            }
+            Image("PriceCatIcon")
+                .resizable()
+                .scaledToFill()
+                .frame(width: 108, height: 108)
+                .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(Theme.Palette.surface, lineWidth: 2)
+                )
+                .themeShadow(Theme.Shadow.lifted)
 
             VStack(spacing: 8) {
                 Text("今天想买什么？")
@@ -307,9 +272,9 @@ struct ChatView: View {
                         Task { await viewModel.send() }
                     } label: {
                         HStack {
-                            Image(systemName: "sparkles")
+                            Image(systemName: "magnifyingglass")
                                 .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(Theme.Palette.brand)
+                                .foregroundStyle(Theme.Palette.highlight)
                             Text(prompt)
                                 .font(Theme.Typo.body())
                                 .foregroundStyle(Theme.Palette.textPrimary)
@@ -326,8 +291,9 @@ struct ChatView: View {
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                                .stroke(Theme.Palette.border, lineWidth: 1)
+                                .stroke(Theme.Palette.border.opacity(0.8), lineWidth: 1)
                         )
+                        .themeShadow(Theme.Shadow.card)
                     }
                     .buttonStyle(.plain)
                 }
@@ -440,7 +406,7 @@ struct ChatView: View {
                     TextField(
                         "",
                         text: $viewModel.inputText,
-                        prompt: Text("说点什么，比如「200 元蓝牙耳机」")
+                        prompt: Text("拍图、打字或点麦克风说需求")
                             .foregroundColor(Theme.Palette.textPlaceholder),
                         axis: .vertical
                     )

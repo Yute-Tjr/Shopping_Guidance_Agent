@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// 单条消息气泡（Coupert 风格）。
+/// 单条消息气泡（PriceCat 图标风格）。
 ///
 /// 关键修复（旧版 bug）：旧实现给 `Text` 加了 `.frame(maxWidth: .infinity, alignment: ...)`，
 /// 这会把气泡背景拉成整行宽度，导致"一句话气泡也撑满屏幕"。
@@ -8,14 +8,16 @@ import SwiftUI
 /// 只 hug `Text` 自身的尺寸。
 ///
 /// 视觉差异：
-/// - 用户气泡：品牌橙底 (#FF6B00) 白字，右对齐，最大 78% 屏宽。
+/// - 用户气泡：黑猫墨色底 + 浅色文字，右对齐，最大 78% 屏宽。
 /// - Assistant 气泡：白底 + 浅边框，左对齐。
 /// - 流式时末尾接一个微动的圆点光标（不是字符 `▍`，避免视觉抖动）。
-/// - 商品卡片与 clarify chips 不嵌进气泡，独立排列在气泡下方。
+/// - 商品卡片与 clarify chips 不嵌进气泡，独立排列在气泡下方；播报和音色选择跟随每条回复。
 struct MessageBubble: View, Equatable {
     let message: ChatMessage
     var onSelectClarify: ((String) -> Void)? = nil
     var onSelectProduct: ((ProductCard) -> Void)? = nil
+    var selectedVoice: SpeechVoice = .default
+    var onSelectVoice: ((SpeechVoice) -> Void)? = nil
     var onSpeakAssistant: ((String) -> Void)? = nil
 
     /// 配合 ChatView 调用处的 .equatable() 使用：父 view 因流式 token 推动反复重评估 body 时，
@@ -23,7 +25,8 @@ struct MessageBubble: View, Equatable {
     /// MarkdownParser.parse(整段)，几轮长对话就让主线程死锁。closure 字段不参与比较——
     /// 每次父 view 重建 closure 都是新实例，会让等式恒 false 失去优化效果。
     static func == (lhs: MessageBubble, rhs: MessageBubble) -> Bool {
-        lhs.message == rhs.message
+        lhs.message == rhs.message &&
+        lhs.selectedVoice == rhs.selectedVoice
     }
 
     var body: some View {
@@ -59,20 +62,58 @@ struct MessageBubble: View, Equatable {
     }
 
     private var speakActionRow: some View {
-        Button {
-            onSpeakAssistant?(message.text)
-        } label: {
-            Image(systemName: "speaker.wave.2.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(Theme.Palette.brand)
-                .frame(width: 28, height: 28)
-                .background(Circle().fill(Theme.Palette.chipSoft))
-                .overlay(
-                    Circle().stroke(Theme.Palette.brand.opacity(0.22), lineWidth: 1)
-                )
+        HStack(spacing: 6) {
+            Button {
+                onSpeakAssistant?(message.text)
+            } label: {
+                Image(systemName: "speaker.wave.2.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.onBrand)
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(Theme.Palette.brand))
+                    .overlay(
+                        Circle().stroke(Theme.Palette.highlight.opacity(0.35), lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("播报回复")
+
+            if let onSelectVoice {
+                Menu {
+                    ForEach(SpeechVoice.all) { voice in
+                        Button {
+                            onSelectVoice(voice)
+                        } label: {
+                            Label(
+                                voice.displayName,
+                                systemImage: selectedVoice == voice ? "checkmark" : "waveform"
+                            )
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Image(systemName: "waveform")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(selectedVoice.displayName)
+                            .font(Theme.Typo.caption(.semibold))
+                            .lineLimit(1)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .foregroundStyle(Theme.Palette.brand)
+                    .padding(.horizontal, 10)
+                    .frame(height: 30)
+                    .background(
+                        Capsule().fill(Theme.Palette.chipSoft)
+                    )
+                    .overlay(
+                        Capsule().stroke(Theme.Palette.border, lineWidth: 1)
+                    )
+                }
+                .accessibilityLabel("选择播报音色")
+            }
         }
-        .buttonStyle(.plain)
-        .accessibilityLabel("播报回复")
+        .padding(.leading, 2)
     }
 
     // MARK: - Assistant content (split by markdown blocks)
