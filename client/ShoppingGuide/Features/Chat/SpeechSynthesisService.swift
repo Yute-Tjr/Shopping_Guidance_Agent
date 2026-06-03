@@ -38,14 +38,27 @@ public protocol SpeechSpeaking: Sendable {
     func speak(_ text: String, voice: SpeechVoice)
 
     @MainActor
+    func hasCachedAudio(for text: String, voice: SpeechVoice) -> Bool
+
+    @MainActor
     func stop()
+}
+
+public extension SpeechSpeaking {
+    @MainActor
+    func hasCachedAudio(for text: String, voice: SpeechVoice) -> Bool {
+        false
+    }
 }
 
 #if canImport(AVFoundation)
 public final class ServerSpeechSynthesisService: NSObject, SpeechSpeaking, @unchecked Sendable {
     private let api: AudioService
+    private var audioCache: [CacheKey: Data] = [:]
+    private var cacheOrder: [CacheKey] = []
     private var player: AVAudioPlayer?
     private var playbackTask: Task<Void, Never>?
+    private let maxCacheItems = 8
 
     public init(api: AudioService) {
         self.api = api
@@ -58,23 +71,29 @@ public final class ServerSpeechSynthesisService: NSObject, SpeechSpeaking, @unch
         guard !trimmed.isEmpty else { return }
         stop()
         let api = self.api
+        let key = CacheKey(text: trimmed, voiceID: voice.id)
+        if let cached = audioCache[key] {
+            play(audio: cached)
+            return
+        }
         playbackTask = Task {
             do {
                 let audio = try await api.synthesize(text: trimmed, voice: voice)
                 await MainActor.run {
-                    do {
-                        let player = try AVAudioPlayer(data: audio)
-                        self.player = player
-                        player.prepareToPlay()
-                        player.play()
-                    } catch {
-                        self.player = nil
-                    }
+                    self.store(audio: audio, for: key)
+                    self.play(audio: audio)
                 }
             } catch {
                 return
             }
         }
+    }
+
+    @MainActor
+    public func hasCachedAudio(for text: String, voice: SpeechVoice) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        return audioCache[CacheKey(text: trimmed, voiceID: voice.id)] != nil
     }
 
     @MainActor
@@ -86,5 +105,33 @@ public final class ServerSpeechSynthesisService: NSObject, SpeechSpeaking, @unch
         }
         player = nil
     }
+
+    @MainActor
+    private func play(audio: Data) {
+        do {
+            let player = try AVAudioPlayer(data: audio)
+            self.player = player
+            player.prepareToPlay()
+            player.play()
+        } catch {
+            self.player = nil
+        }
+    }
+
+    @MainActor
+    private func store(audio: Data, for key: CacheKey) {
+        audioCache[key] = audio
+        cacheOrder.removeAll { $0 == key }
+        cacheOrder.append(key)
+        while cacheOrder.count > maxCacheItems, let oldest = cacheOrder.first {
+            cacheOrder.removeFirst()
+            audioCache.removeValue(forKey: oldest)
+        }
+    }
+}
+
+private struct CacheKey: Hashable {
+    let text: String
+    let voiceID: String
 }
 #endif

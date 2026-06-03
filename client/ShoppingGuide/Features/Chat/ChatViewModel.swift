@@ -27,6 +27,8 @@ public final class ChatViewModel: ObservableObject {
     @Published public var isListening: Bool = false
     /// Phase 5C：语音权限 / 识别错误提示。
     @Published public var voiceNotice: String? = nil
+    /// Phase 5C：TTS 合成/播放准备态提示。
+    @Published public var speechNotice: String? = nil
     /// Phase 5C：是否在 assistant 回复结束后自动播报。
     @Published public var autoSpeakEnabled: Bool = false
     /// Phase 5C：TTS 播报音色。
@@ -43,6 +45,7 @@ public final class ChatViewModel: ObservableObject {
     /// 累积到 buffer，100ms 一次性 flush，把 publish 频率降到 ~10Hz，肉眼仍是流式。
     private var pendingTokenBuffer: String = ""
     private var pendingFlushTask: Task<Void, Never>? = nil
+    private var speechNoticeClearTask: Task<Void, Never>? = nil
     private static let tokenFlushIntervalNs: UInt64 = 100_000_000  // 100ms
     private var activeSendTask: Task<Void, Never>?
     private var activeTurnID = UUID()
@@ -249,10 +252,26 @@ public final class ChatViewModel: ObservableObject {
     public func speakAssistantText(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        speechSpeaker?.speak(trimmed, voice: selectedVoice)
+        guard let speechSpeaker else { return }
+        speechNoticeClearTask?.cancel()
+        if speechSpeaker.hasCachedAudio(for: trimmed, voice: selectedVoice) {
+            speechNotice = nil
+        } else {
+            speechNotice = "正在准备朗读..."
+            speechNoticeClearTask = Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                self.speechNotice = nil
+                self.speechNoticeClearTask = nil
+            }
+        }
+        speechSpeaker.speak(trimmed, voice: selectedVoice)
     }
 
     public func stopSpeaking() {
+        speechNoticeClearTask?.cancel()
+        speechNoticeClearTask = nil
+        speechNotice = nil
         speechSpeaker?.stop()
     }
 
@@ -274,6 +293,8 @@ public final class ChatViewModel: ObservableObject {
         activeTurnID = UUID()
         pendingFlushTask?.cancel()
         pendingFlushTask = nil
+        speechNoticeClearTask?.cancel()
+        speechNoticeClearTask = nil
         pendingTokenBuffer.removeAll(keepingCapacity: true)
         messages.removeAll()
         inputText = ""
@@ -284,6 +305,7 @@ public final class ChatViewModel: ObservableObject {
         cancelVoiceInput()
         stopSpeaking()
         voiceNotice = nil
+        speechNotice = nil
     }
 
     private func cancelVoiceInput() {

@@ -364,6 +364,20 @@ struct ChatView: View {
                     .padding(.top, 6)
             }
 
+            if let notice = viewModel.speechNotice {
+                HStack(spacing: 6) {
+                    ProgressView()
+                        .controlSize(.mini)
+                    Text(notice)
+                        .font(Theme.Typo.caption())
+                        .foregroundStyle(Theme.Palette.textSecondary)
+                    Spacer()
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, Theme.Spacing.l)
+                .padding(.top, 6)
+            }
+
             // Phase 5：选好图但还没发送时显示的缩略图条
             if let picked = viewModel.pickedImage {
                 HStack(spacing: Theme.Spacing.s) {

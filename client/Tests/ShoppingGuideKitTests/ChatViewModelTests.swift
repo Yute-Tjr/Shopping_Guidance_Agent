@@ -84,15 +84,26 @@ final class FakeSpeechRecognizer: SpeechRecognizing, @unchecked Sendable {
 @MainActor
 final class FakeSpeechSpeaker: SpeechSpeaking, @unchecked Sendable {
     var spokenItems: [(text: String, voice: SpeechVoice)] = []
+    var cachedItems: Set<SpeechCacheKey> = []
     var stopCount = 0
 
     func speak(_ text: String, voice: SpeechVoice) {
         spokenItems.append((text: text, voice: voice))
     }
 
+    func hasCachedAudio(for text: String, voice: SpeechVoice) -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cachedItems.contains(SpeechCacheKey(text: trimmed, voiceID: voice.id))
+    }
+
     func stop() {
         stopCount += 1
     }
+}
+
+struct SpeechCacheKey: Hashable {
+    let text: String
+    let voiceID: String
 }
 
 private func sampleCard(_ pid: String = "p_test") -> ProductCard {
@@ -438,5 +449,37 @@ struct ChatViewModelTests {
 
         #expect(speaker.spokenItems.map(\.text) == ["请听这段回复"])
         #expect(speaker.spokenItems.map(\.voice) == [vm.selectedVoice])
+    }
+
+    @Test func speakingShowsPreparingNoticeAndStopClearsIt() async {
+        let speaker = FakeSpeechSpeaker()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechSpeaker: speaker
+        )
+
+        vm.speakAssistantText("请听这段回复")
+
+        #expect(vm.speechNotice == "正在准备朗读...")
+        #expect(speaker.spokenItems.map(\.text) == ["请听这段回复"])
+
+        vm.stopSpeaking()
+
+        #expect(vm.speechNotice == nil)
+        #expect(speaker.stopCount == 1)
+    }
+
+    @Test func cachedSpeechSkipsPreparingNotice() async {
+        let speaker = FakeSpeechSpeaker()
+        let vm = ChatViewModel(
+            transport: FakeChatTransport(events: []),
+            speechSpeaker: speaker
+        )
+        speaker.cachedItems.insert(SpeechCacheKey(text: "请听这段回复", voiceID: vm.selectedVoice.id))
+
+        vm.speakAssistantText("请听这段回复")
+
+        #expect(vm.speechNotice == nil)
+        #expect(speaker.spokenItems.map(\.text) == ["请听这段回复"])
     }
 }
