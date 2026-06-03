@@ -4,7 +4,7 @@
 
 - Python **3.11**（与 `pyproject.toml` 中 `requires-python = ">=3.11,<3.13"` 对齐）
 - MySQL **8.0+**（开发期推荐 `docker/mysql` 一键起容器）
-- 可访问火山方舟接口的网络环境（`ARK_BASE_URL`）
+- 可访问火山方舟 / OpenSpeech 接口的网络环境（`ARK_BASE_URL`、ASR/TTS WebSocket）
 
 ## 一键启动
 
@@ -18,7 +18,7 @@ python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 2. 配置环境变量（ARK_API_KEY 必填）
+# 2. 配置环境变量（ARK_API_KEY 必填；语音可选 ARK_AUDIO_API_KEY）
 cp .env.example .env
 $EDITOR .env
 
@@ -36,6 +36,39 @@ curl http://127.0.0.1:8000/
 curl http://127.0.0.1:8000/healthz
 ```
 
+## Phase 5C 语音接口
+
+后端把 iOS 语音能力收口成 3 个 HTTP 接口，端侧不直接连接火山 OpenSpeech：
+
+| 接口 | 用途 |
+| --- | --- |
+| `GET /api/v1/audio/voices` | 返回可选 TTS 音色与默认音色 |
+| `POST /api/v1/audio/asr` | multipart 上传 16k / 16-bit / mono PCM，返回 `{text}` |
+| `POST /api/v1/audio/tts` | JSON `{text, voice}`，返回 `audio/wav` |
+
+语音默认复用 `ARK_EMBEDDING_API_KEY` 或 `ARK_API_KEY`；如果语音服务单独开通 key，可在 `.env` 里覆盖：
+
+```bash
+ARK_AUDIO_API_KEY=ark-your-audio-key
+ARK_ASR_ENDPOINT=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel
+ARK_TTS_ENDPOINT=wss://openspeech.bytedance.com/api/v3/tts/bidirection
+ARK_ASR_RESOURCE_ID=volc.seedasr.sauc.duration
+ARK_TTS_RESOURCE_ID=seed-tts-2.0
+ARK_TTS_DEFAULT_VOICE=saturn_zh_female_cancan_tob
+```
+
+最小自测：
+
+```bash
+curl -s http://127.0.0.1:8000/api/v1/audio/voices | python3 -m json.tool
+curl -s -X POST http://127.0.0.1:8000/api/v1/audio/tts \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"PriceCat 语音播报测试","voice":"saturn_zh_female_cancan_tob"}' \
+  --output /tmp/pricecat_tts.wav
+# ASR 需要准备 16k / 16-bit / mono raw PCM：
+# curl -s -F 'file=@/tmp/speech.pcm;type=audio/pcm' http://127.0.0.1:8000/api/v1/audio/asr
+```
+
 ## 目录索引
 
 ```
@@ -44,6 +77,11 @@ server/
 │   ├── main.py            # FastAPI 入口（已就位）
 │   ├── config.py          # Pydantic Settings（已就位）
 │   ├── api/               # 路由层（Phase 2 起补齐）
+│   │   ├── chat.py        # SSE 对话流
+│   │   ├── products.py    # 商品详情
+│   │   ├── upload.py      # Phase 5B 图片上传
+│   │   └── audio.py       # Phase 5C ASR / TTS HTTP 网关
+│   ├── audio/             # Phase 5C OpenSpeech ASR/TTS 客户端
 │   ├── agent/             # Agent 编排（Phase 2 起补齐）
 │   ├── rag/               # RAG 检索（Phase 1 起补齐）
 │   ├── llm/               # LLM / VLM 客户端（Phase 2 起补齐）

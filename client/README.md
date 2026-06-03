@@ -6,12 +6,12 @@
 - macOS 14+
 - iOS 部署目标 **16.0+**
 - Swift **5.9**
+- 语音输入 / 播报需要模拟器或真机允许麦克风权限；工程已配置 `NSMicrophoneUsageDescription` / `NSSpeechRecognitionUsageDescription`
 
 ## Phase 0 验收：跑通空白页
 
-由于 `.xcodeproj` 是二进制 plist，无法在仓库里手写生成，本仓库只提交了
-`ShoppingGuide/` 下的 Swift 源码骨架（详见文末"目录索引"）。首次本地准备
-需要在 Xcode 里生成一份 `.xcodeproj`，再让它指向仓库里的源码目录。
+当前仓库已提交 `ShoppingGuide.xcodeproj`，通常直接打开即可。下面的 Phase 0
+步骤保留给需要在本机重建 `.xcodeproj` 的场景。
 
 ### 关键约束（先看，避免踩坑）
 
@@ -158,9 +158,9 @@ ShoppingGuide/
 │   ├── ShoppingGuideApp.swift     # @main → NavigationStack { ChatView(env:) }
 │   └── AppEnvironment.swift
 ├── Models/                         # ChatMessage / ProductCard / SSEEvent / ClarifyPayload
-├── Networking/                     # APIClient / StreamingClient / SSEParser / Endpoints
+├── Networking/                     # APIClient / StreamingClient / SSEParser / UploadService / AudioService
 └── Features/
-    ├── Chat/                       # ChatView / ChatViewModel / ChatTransport / MessageBubble
+    ├── Chat/                       # ChatView / ChatViewModel / ChatTransport / MessageBubble / ImagePicker / Speech*
     └── Product/                    # ProductCardView / ProductDetailView
 ```
 
@@ -203,8 +203,27 @@ DEVELOPER_DIR=$DEV xcrun simctl io "$UDID" screenshot /tmp/phase3.png && open /t
 ```bash
 cd "$(git rev-parse --show-toplevel)/client"
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test
-# 期望：18 用例全过（SSEParser × 12 + ChatViewModel × 6）
+# 期望：49 用例全过（SSEParser 12 + ChatViewModel 20 + MarkdownParser 15 + ProductNavigation 2）
 ```
+
+## Phase 5C 验收：语音输入 + TTS 播报
+
+Phase 5C 已在客户端接入服务端音频网关：
+
+| 文件 | 作用 |
+| --- | --- |
+| `Networking/AudioService.swift` | `transcribe(pcm:)` 上传 `/api/v1/audio/asr`，`synthesize(text:voice:)` 调 `/api/v1/audio/tts` 并返回 WAV |
+| `Features/Chat/SpeechRecognitionService.swift` | `AVAudioEngine` 录音并转 16k / 16-bit / mono PCM；系统 `SFSpeechRecognizer` 仅作为录音链路不可用时的降级 |
+| `Features/Chat/SpeechSynthesisService.swift` | 定义 10 个服务端音色，拉取 WAV 后用 `AVAudioPlayer` 播放，并缓存最近 8 条音频 |
+| `Features/Chat/ChatView.swift` | Header 提供音色菜单和自动播报开关；输入栏提供麦克风按钮；assistant 气泡提供单条播报按钮 |
+
+手动验收路径：
+
+1. 先启动后端，并确认 `/api/v1/audio/voices` 可访问。
+2. Xcode 启动 App，首次点麦克风时允许麦克风权限。
+3. 点麦克风开始录音，再点一次停止；预期 ASR 文本回填输入框。
+4. 发送问题后，点 assistant 气泡的 speaker 按钮；预期听到服务端 TTS 播报。
+5. Header 切换音色并打开自动播报；下一条 assistant 回复结束后应自动播放。
 
 ### Phase 3 踩到的坑
 
@@ -222,8 +241,8 @@ client/
     ├── App/
     │   ├── ShoppingGuideApp.swift      # @main + Scene + Phase 0 占位首页
     │   └── AppEnvironment.swift        # 全局环境（BaseURL / sessionID）
-    ├── Features/                       # 后续阶段填充（Chat/Product/Multimodal/Cart）
-    ├── Networking/
+    ├── Features/                       # Chat/Product/ImagePicker/Speech*
+    ├── Networking/                     # Chat stream / upload / audio
     ├── Models/
     ├── Components/
     └── Resources/
