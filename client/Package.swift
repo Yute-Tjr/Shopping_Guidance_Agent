@@ -35,6 +35,7 @@ let package = Package(
                 "Features/Product/ProductDetailView.swift",
                 "Components/MarkdownView.swift",
                 "Resources/Assets.xcassets",
+                "Resources/app_begin.mp4",
             ],
             sources: [
                 "Models",
