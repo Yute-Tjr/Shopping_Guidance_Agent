@@ -16,13 +16,8 @@ struct ChatView: View {
     /// 用 static 而非 @State：@State 会随 view 重建归零，static 持续整个进程生命周期。
     private static var autoSendDemoFired = false
 
-    /// 4 条预置 query。后续 Phase 4 可换成"近期热搜"或个性化推荐。
-    private let starterPrompts: [String] = [
-        "推荐一款适合油皮的洗面奶",
-        "200 元以下的蓝牙耳机",
-        "对比一下兰蔻和雅诗兰黛的精华",
-        "送女朋友的口红选什么色号",
-    ]
+    /// 4 条预置 query。图标和强调色集中在 StarterPrompt，避免空状态 UI 写死语义。
+    private let starterPrompts = StarterPrompt.defaultItems
 
     @State private var photosPickerItem: PhotosPickerItem? = nil
 
@@ -266,18 +261,25 @@ struct ChatView: View {
             }
 
             VStack(spacing: Theme.Spacing.s) {
-                ForEach(starterPrompts, id: \.self) { prompt in
+                ForEach(starterPrompts) { prompt in
                     Button {
-                        viewModel.inputText = prompt
+                        viewModel.inputText = prompt.text
                         Task { await viewModel.send() }
                     } label: {
-                        HStack {
-                            Image(systemName: "magnifyingglass")
-                                .font(.system(size: 12, weight: .semibold))
-                                .foregroundStyle(Theme.Palette.highlight)
-                            Text(prompt)
+                        HStack(spacing: Theme.Spacing.m) {
+                            Image(systemName: prompt.symbolName)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(prompt.accentRole.color)
+                                .frame(width: 28, height: 28)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(prompt.accentRole.softFill)
+                                )
+                            Text(prompt.text)
                                 .font(Theme.Typo.body())
                                 .foregroundStyle(Theme.Palette.textPrimary)
+                                .lineLimit(2)
+                                .multilineTextAlignment(.leading)
                             Spacer()
                             Image(systemName: "arrow.up.right")
                                 .font(.system(size: 12, weight: .semibold))
@@ -291,11 +293,12 @@ struct ChatView: View {
                         )
                         .overlay(
                             RoundedRectangle(cornerRadius: Theme.Radius.card, style: .continuous)
-                                .stroke(Theme.Palette.border.opacity(0.8), lineWidth: 1)
+                                .stroke(prompt.accentRole.color.opacity(0.28), lineWidth: 1)
                         )
                         .themeShadow(Theme.Shadow.card)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(prompt.text)
                 }
             }
             .padding(.top, Theme.Spacing.s)
@@ -310,75 +313,37 @@ struct ChatView: View {
         let hasImage = viewModel.pickedImage != nil
         let canSend = !viewModel.isSending && (!isInputEmpty || hasImage)
 
-        return VStack(spacing: 0) {
-            // Phase 5：上传错误/降级提示条
+        return VStack(spacing: Theme.Spacing.s) {
             if let notice = viewModel.uploadNotice {
-                Text(notice)
-                    .font(Theme.Typo.caption())
-                    .foregroundStyle(Theme.Palette.priceHot)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, Theme.Spacing.l)
-                    .padding(.top, 6)
+                inputStatusRow(notice, systemImage: "exclamationmark.circle.fill", color: Theme.Palette.priceHot)
             }
 
             if let notice = viewModel.voiceNotice {
-                Text(notice)
-                    .font(Theme.Typo.caption())
-                    .foregroundStyle(Theme.Palette.priceHot)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, Theme.Spacing.l)
-                    .padding(.top, 6)
+                inputStatusRow(notice, systemImage: "waveform.badge.exclamationmark", color: Theme.Palette.priceHot)
             }
 
             if let notice = viewModel.speechNotice {
-                HStack(spacing: 6) {
-                    ProgressView()
-                        .controlSize(.mini)
-                    Text(notice)
-                        .font(Theme.Typo.caption())
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                    Spacer()
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, Theme.Spacing.l)
-                .padding(.top, 6)
+                inputStatusRow(notice, systemImage: nil, color: Theme.Palette.textSecondary, isLoading: true)
             }
 
-            // Phase 5：选好图但还没发送时显示的缩略图条
             if let picked = viewModel.pickedImage {
-                HStack(spacing: Theme.Spacing.s) {
-                    if let uiimg = UIImage(contentsOfFile: picked.localURL.path) {
-                        Image(uiImage: uiimg)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 56, height: 56)
-                            .clipShape(RoundedRectangle(cornerRadius: Theme.Radius.chip))
-                    }
-                    Text("已选图，发送时一同上传")
-                        .font(Theme.Typo.caption())
-                        .foregroundStyle(Theme.Palette.textSecondary)
-                    Spacer()
-                    Button {
-                        viewModel.pickedImage = nil
-                        photosPickerItem = nil
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(Theme.Palette.textSecondary)
-                            .imageScale(.large)
-                    }
-                }
-                .padding(.horizontal, Theme.Spacing.l)
-                .padding(.top, 8)
+                pickedImageShelf(picked)
             }
 
             HStack(spacing: Theme.Spacing.s) {
-                // Phase 5：相册入口
                 ImagePicker(
                     selection: $photosPickerItem,
                     picked: $viewModel.pickedImage,
-                    errorMessage: $viewModel.uploadNotice,
+                    errorMessage: $viewModel.uploadNotice
                 )
-                .frame(width: 32, height: 32)
+                .frame(width: 38, height: 38)
+                .background(
+                    Circle().fill(Theme.Palette.chipSoft)
+                )
+                .overlay(
+                    Circle().stroke(Theme.Palette.border.opacity(0.7), lineWidth: 1)
+                )
+                .accessibilityLabel("选择图片")
 
                 Button {
                     if viewModel.isListening {
@@ -391,43 +356,40 @@ struct ChatView: View {
                     Image(systemName: viewModel.isListening ? "mic.circle.fill" : "mic.fill")
                         .font(.system(size: 17, weight: .semibold))
                         .foregroundStyle(viewModel.isListening ? .white : Theme.Palette.brand)
-                        .frame(width: 32, height: 32)
+                        .frame(width: 38, height: 38)
                         .background(
                             Circle().fill(viewModel.isListening
                                           ? Theme.Palette.brand
                                           : Theme.Palette.chipSoft)
+                        )
+                        .overlay(
+                            Circle().stroke(
+                                viewModel.isListening ? Theme.Palette.highlight.opacity(0.45) : Theme.Palette.border.opacity(0.7),
+                                lineWidth: 1
+                            )
                         )
                 }
                 .disabled(viewModel.isSending)
                 .opacity(viewModel.isSending ? 0.45 : 1)
                 .accessibilityLabel(viewModel.isListening ? "停止语音输入" : "开始语音输入")
 
-                HStack(spacing: Theme.Spacing.s) {
-                    TextField(
-                        "",
-                        text: $viewModel.inputText,
-                        prompt: Text("拍图、打字或点麦克风说需求")
-                            .foregroundColor(Theme.Palette.textPlaceholder),
-                        axis: .vertical
-                    )
-                    .font(Theme.Typo.body())
-                    .foregroundStyle(Theme.Palette.textPrimary)
-                    .lineLimit(1...4)
-                    .focused($inputFocused)
-                    .submitLabel(.send)
-                    .onSubmit { Task { await viewModel.send() } }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(
-                    RoundedRectangle(cornerRadius: Theme.Radius.pill, style: .continuous)
-                        .fill(Theme.Palette.surface)
+                Rectangle()
+                    .fill(Theme.Palette.border.opacity(0.85))
+                    .frame(width: 1, height: 24)
+
+                TextField(
+                    "",
+                    text: $viewModel.inputText,
+                    prompt: Text("拍图、打字或点麦克风说需求")
+                        .foregroundColor(Theme.Palette.textPlaceholder),
+                    axis: .vertical
                 )
-                .overlay(
-                    RoundedRectangle(cornerRadius: Theme.Radius.pill, style: .continuous)
-                        .stroke(inputFocused ? Theme.Palette.brand.opacity(0.5) : Theme.Palette.border,
-                                lineWidth: 1)
-                )
+                .font(Theme.Typo.body())
+                .foregroundStyle(Theme.Palette.textPrimary)
+                .lineLimit(1...4)
+                .focused($inputFocused)
+                .submitLabel(.send)
+                .onSubmit { Task { await viewModel.send() } }
 
                 Button {
                     inputFocused = false
@@ -436,21 +398,127 @@ struct ChatView: View {
                     Image(systemName: "arrow.up")
                         .font(.system(size: 16, weight: .bold))
                         .foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
+                        .frame(width: 38, height: 38)
                         .background(
                             Circle()
-                                .fill(canSend ? Theme.Palette.brand : Theme.Palette.textPlaceholder)
+                                .fill(canSend ? Theme.Palette.brand : Theme.Palette.surfaceTint)
+                        )
+                        .overlay(
+                            Circle().stroke(canSend ? Theme.Palette.highlight.opacity(0.4) : Theme.Palette.border, lineWidth: 1)
                         )
                         .themeShadow(canSend ? Theme.Shadow.lifted
                                               : .init(color: .clear, radius: 0, x: 0, y: 0))
                 }
                 .disabled(!canSend)
+                .opacity(canSend ? 1 : 0.7)
                 .animation(.easeOut(duration: 0.15), value: canSend)
             }
-            .padding(.horizontal, Theme.Spacing.l)
-            .padding(.top, 10)
-            .padding(.bottom, 10)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(Theme.Palette.surface.opacity(0.98))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .stroke(inputFocused ? Theme.Palette.brand.opacity(0.48) : Theme.Palette.border, lineWidth: 1)
+            )
+            .themeShadow(Theme.Shadow.card)
         }
-        .background(Theme.Palette.canvas)
+        .padding(.horizontal, Theme.Spacing.l)
+        .padding(.top, Theme.Spacing.s)
+        .padding(.bottom, 10)
+        .background(
+            Theme.Palette.surfaceTint
+                .opacity(0.72)
+                .ignoresSafeArea(edges: .bottom)
+        )
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Theme.Palette.border)
+                .frame(height: 1)
+        }
+    }
+
+    private func inputStatusRow(
+        _ text: String,
+        systemImage: String?,
+        color: Color,
+        isLoading: Bool = false
+    ) -> some View {
+        HStack(spacing: 7) {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.mini)
+            } else if let systemImage {
+                Image(systemName: systemImage)
+                    .font(.system(size: 12, weight: .semibold))
+            }
+            Text(text)
+                .font(Theme.Typo.caption(.semibold))
+                .lineLimit(2)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(color)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .fill(Theme.Palette.surface.opacity(0.72))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(color.opacity(0.18), lineWidth: 1)
+        )
+    }
+
+    private func pickedImageShelf(_ picked: PickedImage) -> some View {
+        HStack(spacing: Theme.Spacing.s) {
+            if let uiimg = UIImage(contentsOfFile: picked.localURL.path) {
+                Image(uiImage: uiimg)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: 44, height: 44)
+                    .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            } else {
+                Image(systemName: "photo")
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .frame(width: 44, height: 44)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Theme.Palette.chipSoft)
+                    )
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("已选图片")
+                    .font(Theme.Typo.caption(.semibold))
+                    .foregroundStyle(Theme.Palette.textPrimary)
+                Text("发送时会一起上传检索")
+                    .font(Theme.Typo.caption())
+                    .foregroundStyle(Theme.Palette.textSecondary)
+            }
+            Spacer()
+            Button {
+                viewModel.pickedImage = nil
+                photosPickerItem = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .bold))
+                    .foregroundStyle(Theme.Palette.textSecondary)
+                    .frame(width: 30, height: 30)
+                    .background(Circle().fill(Theme.Palette.chipSoft))
+            }
+            .accessibilityLabel("移除图片")
+        }
+        .padding(8)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Theme.Palette.surface.opacity(0.82))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Theme.Palette.border, lineWidth: 1)
+        )
     }
 }

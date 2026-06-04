@@ -62,14 +62,14 @@ struct MessageBubble: View, Equatable {
     }
 
     private var speakActionRow: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 0) {
             Button {
                 onSpeakAssistant?(message.text)
             } label: {
                 Image(systemName: "speaker.wave.2.fill")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundStyle(Theme.Palette.onBrand)
-                    .frame(width: 30, height: 30)
+                    .frame(width: 36, height: 36)
                     .background(Circle().fill(Theme.Palette.brand))
                     .overlay(
                         Circle().stroke(Theme.Palette.highlight.opacity(0.35), lineWidth: 1)
@@ -79,6 +79,11 @@ struct MessageBubble: View, Equatable {
             .accessibilityLabel("播报回复")
 
             if let onSelectVoice {
+                Rectangle()
+                    .fill(Theme.Palette.border)
+                    .frame(width: 1, height: 22)
+                    .padding(.horizontal, 8)
+
                 Menu {
                     ForEach(SpeechVoice.all) { voice in
                         Button {
@@ -91,28 +96,32 @@ struct MessageBubble: View, Equatable {
                         }
                     }
                 } label: {
-                    HStack(spacing: 5) {
+                    HStack(spacing: 6) {
                         Image(systemName: "waveform")
-                            .font(.system(size: 11, weight: .semibold))
+                            .font(.system(size: 12, weight: .semibold))
                         Text(selectedVoice.displayName)
                             .font(Theme.Typo.caption(.semibold))
                             .lineLimit(1)
+                            .minimumScaleFactor(0.85)
                         Image(systemName: "chevron.down")
                             .font(.system(size: 9, weight: .bold))
                     }
                     .foregroundStyle(Theme.Palette.brand)
-                    .padding(.horizontal, 10)
-                    .frame(height: 30)
-                    .background(
-                        Capsule().fill(Theme.Palette.chipSoft)
-                    )
-                    .overlay(
-                        Capsule().stroke(Theme.Palette.border, lineWidth: 1)
-                    )
+                    .frame(minWidth: 78, maxWidth: 118, minHeight: 36)
                 }
                 .accessibilityLabel("选择播报音色")
             }
         }
+        .padding(4)
+        .background(
+            Capsule(style: .continuous)
+                .fill(Theme.Palette.surface.opacity(0.96))
+        )
+        .overlay(
+            Capsule(style: .continuous)
+                .stroke(Theme.Palette.border, lineWidth: 1)
+        )
+        .themeShadow(Theme.Shadow.card)
         .padding(.leading, 2)
     }
 
