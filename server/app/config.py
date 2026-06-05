@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     port: int = 8000
     log_level: str = "INFO"
     cors_origins: str = "*"
+    static_base_url: str | None = None
 
     # ---- Optional ----
     redis_url: str | None = None
