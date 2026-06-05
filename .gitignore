@@ -34,7 +34,7 @@ env/
 # 本地数据：Milvus Lite / 上传图片缓存 / 评测结果
 server/data/
 server/uploads/
-data/
+/data/
 
 # ===== iOS / Swift =====
 # Xcode 用户配置
