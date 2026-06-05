@@ -10,7 +10,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-RUN apt-get update \
+RUN sed -i \
+        -e 's|deb.debian.org|mirrors.aliyun.com|g' \
+        -e 's|security.debian.org|mirrors.aliyun.com|g' \
+        /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
         ca-certificates \
@@ -21,8 +25,8 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY server/requirements.txt /tmp/requirements.txt
-RUN python -m pip install --upgrade pip \
-    && python -m pip install -r /tmp/requirements.txt
+RUN python -m pip install --upgrade pip -i https://mirrors.aliyun.com/pypi/simple/ \
+    && python -m pip install -r /tmp/requirements.txt -i https://mirrors.aliyun.com/pypi/simple/
 
 COPY --chown=app:app server /app
 COPY --chown=app:app ecommerce_agent_dataset /ecommerce_agent_dataset
