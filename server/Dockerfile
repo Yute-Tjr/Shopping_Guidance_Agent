@@ -32,6 +32,7 @@ COPY --chown=app:app server /app
 COPY --chown=app:app ecommerce_agent_dataset /ecommerce_agent_dataset
 
 RUN mkdir -p /app/data /app/data/uploads \
+    && ln -s /ecommerce_agent_dataset /app/ecommerce_agent_dataset \
     && chown -R app:app /app /ecommerce_agent_dataset
 
 USER app

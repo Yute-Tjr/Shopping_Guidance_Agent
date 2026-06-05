@@ -73,7 +73,7 @@ open ShoppingGuide.xcodeproj
   - [x] 子项 3：主动澄清（ClarifyDetector + 13 类目 chips 模板）([详情](#phase-4-3-主动澄清))
   - [x] 子项 4：多轮 memory 摘要压缩（MemorySummarizer + summary 注入 prompt）([详情](#phase-4-4-多轮-memory-摘要压缩))
 - [x] **Phase 5**：多模态交互（拍照找货 + 语音输入 / TTS 播报）—— server + iOS 代码闭环，图搜评测与语音接口测试已覆盖，模拟器 / 真机语音需手动验收 ([详情](#phase-5-多模态图搜与语音交互)，[评测报告](docs/phase5_eval_report.md)，[设计文档](docs/05_多模态设计.md)，[执行计划](docs/phase5_implementation_plan.md))
-- [ ] Phase 6：打磨与交付
+- [x] **Phase 6**：打磨与交付（前端精修 + 开场动画 + ECS Docker 沙箱部署 + Nginx 公网联调）([详情](#phase-6-打磨与交付)，[开发文档](docs/06_打磨交付文档))
 
 ---
 
@@ -1006,6 +1006,118 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 # 拖进模拟器照片库 → app 内点相机按钮选图 → 发送 "找同款"；
 # 点麦克风录音，Header 选择音色 / 开启自动播报，确认回复可播报。
 ```
+
+---
+
+## Phase 6 打磨与交付
+
+Phase 6 把前面已经完成的 RAG、图搜、语音和 iOS 体验收束成可部署、可演示的交付形态。完整记录见 [`docs/06_前端体验优化设计.md`](docs/06_打磨交付文档)。
+
+### (a) 前端体验精修
+
+| 文件 | 实现 |
+| --- | --- |
+| [`client/ShoppingGuide/Features/Chat/StarterPrompt.swift`](client/ShoppingGuide/Features/Chat/StarterPrompt.swift) | 空状态推荐项升级为带图标 / 语义强调色的数据模型 |
+| [`client/ShoppingGuide/Features/Chat/ChatView.swift`](client/ShoppingGuide/Features/Chat/ChatView.swift) | 底部 composer 统一相册、麦克风、文本输入、发送按钮；推荐项接入 `StarterPrompt.defaultItems` |
+| [`client/ShoppingGuide/Features/Chat/MessageBubble.swift`](client/ShoppingGuide/Features/Chat/MessageBubble.swift) | 每条 assistant 回复下方提供逐段朗读按钮，并把音色选择合并到同一个控制组 |
+| [`client/ShoppingGuide/App/LaunchIntroView.swift`](client/ShoppingGuide/App/LaunchIntroView.swift) | 用 `AVPlayerLayer` 播放 `app_begin.mp4`，支持结束、失败和跳过后进入主界面 |
+| [`client/ShoppingGuide/App/AppEnvironment.swift`](client/ShoppingGuide/App/AppEnvironment.swift) | 沙箱期默认连 ECS Nginx 公网入口 `http://121.196.247.225` |
+| [`client/ShoppingGuide-Info.plist`](client/ShoppingGuide-Info.plist) | 显式 Info.plist，含权限文案和沙箱期 HTTP ATS 临时例外 |
+
+> `NSAllowsArbitraryLoads` 只用于沙箱 HTTP 公网 IP 联调。发布前必须切 HTTPS 域名并移除该例外。
+
+### (b) 服务端沙箱部署
+
+| 文件 | 实现 |
+| --- | --- |
+| [`server/Dockerfile`](server/Dockerfile) | Python 3.11 后端镜像，使用阿里云 apt / PyPI 镜像源；复制后端和数据集；创建 `/app/ecommerce_agent_dataset -> /ecommerce_agent_dataset` 软链，保证 `/static/...` 商品图可访问 |
+| [`.dockerignore`](.dockerignore) | 排除 `.env`、虚拟环境、本地数据、测试缓存和构建产物，避免密钥或无关文件进入镜像上下文 |
+| [`docker-compose.sandbox.yml`](docker-compose.sandbox.yml) | 编排 `pricecat_mysql` + `pricecat_api`，API 仅绑定宿主机 `127.0.0.1:8000`，公网入口交给 Nginx |
+| [`server/app/config.py`](server/app/config.py) | 新增 `STATIC_BASE_URL` 配置项，用于把商品图拼成公网可访问 URL |
+| [`server/.env.example`](server/.env.example) | 增加 `STATIC_BASE_URL=` 模板；真实公网 IP / 域名只写服务器 `server/.env` |
+
+沙箱拓扑：
+
+```
+iOS / 浏览器
+  -> http://121.196.247.225:80
+  -> Nginx
+  -> http://127.0.0.1:8000
+  -> Docker: pricecat_api
+  -> Docker: pricecat_mysql
+```
+
+安全组只开放 `22`、`80`、`443`；不要开放 `8000` 和 `3306`。
+
+### (c) ECS 复跑指令
+
+首次部署或代码更新后：
+
+```bash
+cd /opt/pricecat-sandbox/price_cat
+git pull
+
+docker compose -f docker-compose.sandbox.yml build api
+docker compose -f docker-compose.sandbox.yml up -d --force-recreate api
+```
+
+服务器 `server/.env` 需要设置：
+
+```env
+MYSQL_DSN=mysql+asyncmy://shopping_user:shopping_pwd@mysql:3306/shopping_guide?charset=utf8mb4
+MILVUS_DB_PATH=/app/data/milvus_lite.db
+STATIC_BASE_URL=http://121.196.247.225
+```
+
+首次部署或数据集变化后初始化：
+
+```bash
+docker compose -f docker-compose.sandbox.yml exec api python -m app.db.init_db
+docker compose -f docker-compose.sandbox.yml exec api python -m scripts.seed_mysql --truncate
+docker compose -f docker-compose.sandbox.yml exec api python -m scripts.build_index --rebuild
+docker compose -f docker-compose.sandbox.yml exec api python -m scripts.build_image_index --rebuild
+```
+
+只改 `.env` / `STATIC_BASE_URL` 时无需重新灌库建索引：
+
+```bash
+docker compose -f docker-compose.sandbox.yml up -d --force-recreate api
+```
+
+### (d) 沙箱验收
+
+```bash
+# 容器状态
+docker compose -f docker-compose.sandbox.yml ps
+
+# 宿主机本地健康检查
+curl http://127.0.0.1:8000/healthz
+
+# 公网健康检查
+curl http://121.196.247.225/healthz
+
+# 商品详情与图片 URL
+curl -s http://121.196.247.225/api/v1/products/p_beauty_001 | python3 -m json.tool | grep image_url
+
+# 静态商品图（百分号编码后的中文路径）
+curl -I "http://121.196.247.225/static/1_%E7%BE%8E%E5%A6%86%E6%8A%A4%E8%82%A4/images/p_beauty_001_live.jpg"
+```
+
+聊天流公网 smoke：
+
+```bash
+curl -N -X POST http://121.196.247.225/api/v1/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"session_id":null,"message":"推荐一款适合通勤的口红"}'
+```
+
+### (e) 发布前收口
+
+- 将 `http://121.196.247.225` 替换为正式 HTTPS 域名。
+- Nginx 配置证书，`STATIC_BASE_URL=https://api.your-domain.com`。
+- iOS `baseURL` 改为 Debug / Release 配置注入，不再硬编码沙箱公网 IP。
+- 移除 `ShoppingGuide-Info.plist` 中的 `NSAllowsArbitraryLoads`。
+- App Store / TestFlight 前完成隐私政策、权限说明、截图与审核说明。
 
 ---
 
