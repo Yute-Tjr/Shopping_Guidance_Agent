@@ -332,6 +332,7 @@ class QueryRewriter:
             )
             logger.info("history/summary 补全后 search_query=%s", rule.search_query)
 
+        _enrich_taxonomy_from_text(rule, rule.search_query)
         return rule
 
     # ---- rule path ----
@@ -570,6 +571,26 @@ def _merge(
     return out
 
 
+def _enrich_taxonomy_from_text(parsed: ParsedQuery, text: str) -> None:
+    """从最终 search_query 回填类目字段。
+
+    history 补全可能把「跑鞋 / 精华」这类主体词拼回 search_query，但规则抽取
+    已经在补全前完成；这里把最终 query 再扫一遍，保证后续 SQL/Milvus filter
+    也能拿到 category / sub_category。
+    """
+    lower_text = (text or "").lower()
+    for alias, canonical in _CATEGORY_ALIASES.items():
+        if alias in lower_text or alias in text:
+            if canonical not in parsed.categories:
+                parsed.categories.append(canonical)
+    for c in KNOWN_CATEGORIES:
+        if c in text and c not in parsed.categories:
+            parsed.categories.append(c)
+    for sub in _extract_sub_categories(text, price_max=parsed.price_max):
+        if sub not in parsed.sub_categories:
+            parsed.sub_categories.append(sub)
+
+
 # 承接关键词：句子里出现这些词时认为是接续上文的补充约束，
 # 哪怕规则路径还没抓到 filter 也要先补 history/summary 上下文，
 # 让 embedding 拿到主体语义。
@@ -589,6 +610,27 @@ _FOLLOWUP_HINTS: tuple[str, ...] = (
     "那个", "那些", "那款", "这样的",
     # 价格趋势
     "便宜一点", "贵一点", "实惠一点", "高端一点", "再便宜", "再贵",
+)
+
+
+# 主动澄清 chips 选项通常是很短的偏好词。前端点击后只发送选项文本，
+# 例如上一轮「推荐一款精华」→ 本轮「保湿补水」。这类 query 自身没有品类主体，
+# 必须从 history/summary 补回「精华」，否则向量召回容易打到默认高热词商品。
+_CLARIFY_OPTION_HINTS: tuple[str, ...] = (
+    "抗初老", "保湿补水", "保湿", "补水", "提亮肤色", "提亮", "修护敏感", "修护",
+    "油性皮肤", "干性皮肤", "敏感肌", "混合肌",
+    "日常通勤", "户外运动", "海边度假",
+    "深层保湿", "抗皱紧致", "夜间修复",
+    "拍照优先", "续航优先", "性能旗舰", "性价比优先",
+    "轻薄办公", "高性能创作", "学生预算", "游戏本",
+    "主动降噪", "音质 HiFi", "长续航", "百元平价",
+    "日常慢跑", "马拉松竞速", "户外越野", "缓震回弹",
+    "实战外场", "缓震保护", "明星签名款", "性价比",
+    "敏感肌可用",
+    "无糖低卡", "运动补给", "茶饮", "碳酸饮料",
+    "速溶便携", "挂耳现冲", "冷萃即饮",
+    "学生书包", "户外徒步", "短途旅行",
+    "健康低卡", "解馋油炸", "坚果干果", "下午茶甜点",
 )
 
 
@@ -613,6 +655,8 @@ def _needs_context_completion(parsed: ParsedQuery, *, original: str) -> bool:
         return True
     if len(sq) <= 2:
         return True
+    if _is_clarify_option_without_subject(parsed, original):
+        return True
     # 承接关键词触发：原句较短（< 15 字符）且开头 6 字内含承接词。
     # 限制"开头 6 字"是为避免"换季敏感肌的精华"这种把"换"夹在描述里的句子误触发。
     if len(original) < 15:
@@ -620,6 +664,16 @@ def _needs_context_completion(parsed: ParsedQuery, *, original: str) -> bool:
         if any(hint in head for hint in _FOLLOWUP_HINTS):
             return True
     return False
+
+
+def _is_clarify_option_without_subject(parsed: ParsedQuery, original: str) -> bool:
+    """短偏好词没有明确品类时，视为承接上一轮 clarify 问题。"""
+    if parsed.categories or parsed.sub_categories:
+        return False
+    text = re.sub(r"\s+", "", original or "")
+    if not text or len(text) > 12:
+        return False
+    return any(hint in text for hint in _CLARIFY_OPTION_HINTS)
 
 
 def _merge_history_context(

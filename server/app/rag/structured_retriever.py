@@ -46,6 +46,7 @@ class StructuredRetriever:
         price_min: Optional[float] = None,
         price_max: Optional[float] = None,
         categories: Optional[list[str]] = None,
+        sub_categories: Optional[list[str]] = None,
         brands_include: Optional[list[str]] = None,
         brands_exclude: Optional[list[str]] = None,
         limit: int = 5,
@@ -58,7 +59,7 @@ class StructuredRetriever:
         """
         has_any = (
             price_min is not None or price_max is not None or
-            categories or brands_include or brands_exclude
+            categories or sub_categories or brands_include or brands_exclude
         )
         if not has_any:
             logger.warning("StructuredRetriever 收到空 filter，拒绝执行")
@@ -70,6 +71,8 @@ class StructuredRetriever:
 
             if categories:
                 conds.append(Product.category.in_(categories))
+            if sub_categories:
+                conds.append(Product.sub_category.in_(sub_categories))
             if brands_include:
                 conds.append(Product.brand.in_(brands_include))
             if brands_exclude:
@@ -99,8 +102,8 @@ class StructuredRetriever:
         if not products:
             logger.info(
                 "StructuredRetriever 命中 0 条 (price_min=%s, price_max=%s, "
-                "categories=%s, brands_exclude=%s)",
-                price_min, price_max, categories, brands_exclude,
+                "categories=%s, sub_categories=%s, brands_exclude=%s)",
+                price_min, price_max, categories, sub_categories, brands_exclude,
             )
 
         # 每件商品取出价格区间，转 RetrievedProduct

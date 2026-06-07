@@ -272,6 +272,25 @@ async def test_history_completes_followup_with_only_price():
     assert pq.price_min == 1000
     # search_query 必须含主体词"跑鞋"，否则向量召回会打偏
     assert "跑鞋" in pq.search_query
+    assert "服饰运动" in pq.categories
+    assert pq.sub_categories == ["跑步鞋"]
+
+
+@pytest.mark.asyncio
+async def test_history_price_followup_after_clarify_chip_restores_taxonomy_filters():
+    rw = build_query_rewriter()
+    history = [
+        {"role": "user", "content": "推荐一款跑鞋"},
+        {"role": "assistant", "content": ""},
+        {"role": "user", "content": "缓震回弹"},
+        {"role": "assistant", "content": "为你推荐三款跑鞋"},
+    ]
+    pq = await rw.parse("1000 元以下的", history=history)
+    assert pq.price_max == 1000
+    assert "跑鞋" in pq.search_query
+    assert "服饰运动" in pq.categories
+    assert pq.sub_categories == ["跑步鞋"]
+    assert 'sub_category in ["跑步鞋"]' in (pq.to_filter_expr() or "")
 
 
 @pytest.mark.asyncio
@@ -310,6 +329,26 @@ async def test_history_completes_followup_with_price_softener():
     # 关键：search_query 必须含"洗面奶"主体，否则向量召回打偏
     assert "洗面奶" in pq.search_query
     assert "再便宜一点" in pq.search_query or "便宜" in pq.search_query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("option", ["抗初老", "保湿补水", "提亮肤色", "修护敏感"])
+async def test_history_completes_clarify_chip_option_with_subject(option: str):
+    """澄清 chips 只发送选项文本时，也必须从 history 补回原始品类主体。
+
+    复现路径：
+    1. 用户输入「推荐一款精华」→ ClarifyDetector 短路，history 记录该 user 句；
+    2. 用户点击 chip → 前端只发送选项文本；
+    3. 如果 search_query 不含「精华」，向量召回容易被其它护肤品或默认抗初老精华带偏。
+    """
+    rw = build_query_rewriter()
+    history = [
+        {"role": "user", "content": "推荐一款精华"},
+        {"role": "assistant", "content": ""},
+    ]
+    pq = await rw.parse(option, history=history)
+    assert "精华" in pq.search_query
+    assert option in pq.search_query
 
 
 @pytest.mark.asyncio

@@ -162,8 +162,7 @@ struct ChatView: View {
                     MessageBubble(
                         message: msg,
                         onSelectClarify: { option in
-                            viewModel.inputText = option
-                            Task { await viewModel.send() }
+                            Task { await viewModel.send(text: option) }
                         },
                         onSelectProduct: { card in
                             productNavigation.select(productID: card.productId)

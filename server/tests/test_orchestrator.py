@@ -46,6 +46,16 @@ class _FakeRetriever:
         return list(self._products)
 
 
+class _FakeRetrieverByQuery:
+    def __init__(self, products_by_query: dict[str, list[RetrievedProduct]]) -> None:
+        self._products_by_query = products_by_query
+        self.calls: list[str] = []
+
+    def search(self, query: str, **_kw):
+        self.calls.append(query)
+        return list(self._products_by_query.get(query, []))
+
+
 class _FakeProductRepo:
     """伪 MySQL 商品仓库。"""
 
@@ -63,6 +73,16 @@ class _FakeProductRepo:
             "price_range": {"min": 79.0, "max": 129.0},
             "skus": [{"sku_id": f"s_{product_id}_1", "properties": {"容量": "50ml"}, "price": 99.0}],
         }
+
+
+class _FakeStructuredRetriever:
+    def __init__(self, products: list[RetrievedProduct]) -> None:
+        self._products = products
+        self.calls: list[dict] = []
+
+    async def search(self, **kwargs):
+        self.calls.append(kwargs)
+        return list(self._products)
 
 
 class _FakeLLM:
@@ -119,6 +139,39 @@ async def test_recommend_happy_path_emits_expected_events():
     assert card["price_range"]["min"] == 79.0
     assert card["reason"] == "控油温和"
     assert repo.lookups == ["p_a"]
+
+
+@pytest.mark.asyncio
+async def test_price_followup_uses_sql_fallback_with_sub_category_filters():
+    from app.agent.query_rewriter import ParsedQuery
+
+    retr = _FakeRetriever([])
+    structured = _FakeStructuredRetriever([_product("p_clothes_007", title="Nike 跑鞋")])
+    orch = AgentOrchestrator(
+        retriever=retr,
+        llm=_FakeLLM([]),
+        product_repo=_FakeProductRepo(),
+        memory=ConversationMemory(),
+        structured_retriever=structured,
+    )
+    parsed = ParsedQuery(
+        search_query="推荐一款跑鞋 缓震回弹 的",
+        price_max=1000,
+        categories=["服饰运动"],
+        sub_categories=["跑步鞋"],
+    )
+
+    hits = await orch._recommend_retrieve(
+        parsed,
+        filter_expr=parsed.to_filter_expr(),
+        original_message="1000 元以下的",
+    )
+
+    assert [p.product_id for p in hits] == ["p_clothes_007"]
+    assert structured.calls[0]["categories"] == ["服饰运动"]
+    assert structured.calls[0]["sub_categories"] == ["跑步鞋"]
+    assert structured.calls[0]["price_max"] == 1000
+    assert retr.calls == []
 
 
 @pytest.mark.asyncio
@@ -399,10 +452,65 @@ async def test_compare_followup_uses_last_recommended_ids_without_llm_target_par
     ]
 
     assert extractor.calls == 0
-    assert retr.calls[:2] == ["p_huawei", "p_apple"]
+    assert retr.calls == []
     assert [e["data"]["product_id"] for e in events if e["event"] == "product_card"] == [
         "p_huawei",
         "p_apple",
+    ]
+    assert events[-1]["event"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_compare_followup_uses_exact_previous_ids_when_vector_search_drifts():
+    """承接“这两款产品”时不能把上一轮 product_id 再当 query 走向量召回。
+
+    真实 Milvus 对 query="p_xxx" 不保证精确命中自身；这里模拟它召回到其它精华。
+    正确行为是直接按 memory 中的上一轮卡片 ID 构造对比候选。
+    """
+    mem = ConversationMemory()
+    session = mem.get_or_create(None)
+    mem.save_turn(
+        session.id,
+        "推荐两款精华",
+        "为你推荐两款精华。",
+        ["p_prev_a", "p_prev_b"],
+    )
+    retr = _FakeRetrieverByQuery({
+        "p_prev_a": [_product("p_wrong_a")],
+        "p_prev_b": [_product("p_wrong_b")],
+        "对比这两款产品": [_product("p_wrong_c"), _product("p_wrong_d")],
+    })
+    repo = _FakeProductRepo()
+    extractor = _FakeCompareExtractor(targets=["不应该调用"])
+    llm_tokens = [
+        "| 对比维度 | 上轮A | 上轮B |\n",
+        "| --- | --- | --- |\n",
+        "| 价格区间 | ￥79-129 | ￥79-129 |\n\n",
+        "第一款更适合预算优先。\n",
+        "```product_cards\n",
+        '[{"product_id":"p_prev_a","reason":"上一轮第一款"},'
+        '{"product_id":"p_prev_b","reason":"上一轮第二款"}]\n',
+        "```",
+    ]
+    orch = AgentOrchestrator(
+        retriever=retr,
+        llm=_FakeLLM(llm_tokens),
+        product_repo=repo,
+        memory=mem,
+        compare_extractor=extractor,
+    )
+
+    events = [
+        e async for e in orch.orchestrate(
+            ChatRequest(session_id=session.id, message="对比这两款产品")
+        )
+    ]
+
+    assert extractor.calls == 0
+    assert retr.calls == []
+    assert [e["data"]["product_id"] for e in events if e["event"] == "product_card"] == [
+        "p_prev_a",
+        "p_prev_b",
     ]
     assert events[-1]["event"] == "done"
 

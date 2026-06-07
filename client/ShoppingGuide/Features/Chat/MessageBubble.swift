@@ -334,6 +334,7 @@ struct MessageBubble: View, Equatable {
                                 Capsule().stroke(Theme.Palette.brand.opacity(0.3), lineWidth: 1)
                             )
                     }
+                    .buttonStyle(.plain)
                 }
             }
         }

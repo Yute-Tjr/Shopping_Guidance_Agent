@@ -266,6 +266,7 @@ class AgentOrchestrator:
                 price_min=parsed.price_min,
                 price_max=parsed.price_max,
                 categories=parsed.categories or None,
+                sub_categories=parsed.sub_categories or None,
                 brands_include=parsed.brands_include or None,
                 brands_exclude=parsed.brands_exclude or None,
                 limit=5,
@@ -302,8 +303,18 @@ class AgentOrchestrator:
         """
         direct_id_targets = list(recent_product_ids or [])
         if direct_id_targets:
+            direct_products = await self._load_products_by_ids(direct_id_targets[:3])
+            if len(direct_products) >= 2:
+                logger.info(
+                    "compare 承接上一轮推荐 product_id exact targets=%s",
+                    [p.product_id for p in direct_products],
+                )
+                return direct_products
             targets = direct_id_targets[:3]
-            logger.info("compare 承接上一轮推荐 product_id targets=%s", targets)
+            logger.info(
+                "compare 承接上一轮推荐 product_id 但精确加载不足，回退检索 targets=%s",
+                targets,
+            )
         else:
             targets = []
 
@@ -388,6 +399,25 @@ class AgentOrchestrator:
         view = dict(view)
         view["reason"] = raw_card.get("reason", "")
         return view
+
+    async def _load_products_by_ids(self, product_ids: list[str]) -> list[RetrievedProduct]:
+        """按 product_id 从商品库精确加载 compare 候选。
+
+        用于“对比这两款产品”这类承接句。这里不能把 product_id 当普通 query
+        再走向量检索，否则 Milvus 可能召回相近但不是上一轮卡片的商品。
+        """
+        products: list[RetrievedProduct] = []
+        seen: set[str] = set()
+        for pid in product_ids:
+            if pid in seen:
+                continue
+            seen.add(pid)
+            view = await self.product_repo.get_card_view(pid)
+            if view is None:
+                logger.warning("compare 精确加载失败：product_id=%s 不在 MySQL", pid)
+                continue
+            products.append(_retrieved_from_card_view(view))
+        return products
 
 
     async def _multimodal_orchestrate(self, req: ChatRequest, session) -> AsyncIterator[dict]:
@@ -494,3 +524,28 @@ def _recent_compare_targets(message: str, last_recommended_ids: list[str]) -> li
     if not any(hint in text for hint in _RECENT_COMPARE_REFERENCE_HINTS):
         return []
     return list(dict.fromkeys(last_recommended_ids))[:3]
+
+
+def _retrieved_from_card_view(view: dict[str, Any]) -> RetrievedProduct:
+    """把 ProductRepository card view 转成 compare prompt 所需的 RetrievedProduct。"""
+    price_range = view.get("price_range") or {}
+    min_price = float(price_range.get("min") or 0.0)
+    max_price = float(price_range.get("max") or min_price)
+    title = str(view.get("title") or "")
+    brand = str(view.get("brand") or "")
+    category = str(view.get("category") or "")
+    snippet_parts = [part for part in (title, brand, category) if part]
+    return RetrievedProduct(
+        product_id=str(view.get("product_id") or ""),
+        score=1.0,
+        brand=brand,
+        category=category,
+        sub_category=str(view.get("sub_category") or ""),
+        base_price=min_price,
+        min_sku_price=min_price,
+        max_sku_price=max_price,
+        best_chunk_text=" | ".join(snippet_parts),
+        best_chunk_type="card_view",
+        supporting_chunks=[" | ".join(snippet_parts)] if snippet_parts else [],
+        title=title,
+    )

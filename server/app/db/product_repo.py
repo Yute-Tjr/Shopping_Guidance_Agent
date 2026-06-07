@@ -6,6 +6,7 @@ Orchestrator hydrate 卡片、/products/{id} 详情页都走这里。
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlparse
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -16,6 +17,31 @@ from app.db.mysql_session import AsyncSessionLocal
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+_STATIC_BASE_PLACEHOLDERS = {
+    "your-ip-address",
+    "http://your-ip-address",
+    "https://your-ip-address",
+}
+
+
+def _normalize_static_base_url(base: str | None, *, port: int = 8000) -> str:
+    """归一化商品图 host，避免本地联调时把 .env 占位值发给客户端。"""
+    fallback = f"http://127.0.0.1:{port}"
+    cleaned = (base or "").strip().rstrip("/")
+    if not cleaned:
+        return fallback
+    if cleaned.lower() in _STATIC_BASE_PLACEHOLDERS:
+        return fallback
+    if "://" not in cleaned:
+        cleaned = f"http://{cleaned}"
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return fallback
+    if (parsed.hostname or "").lower() == "your-ip-address":
+        return fallback
+    return cleaned
 
 
 def _image_url(image_path: str, base: str) -> str:
@@ -125,6 +151,9 @@ def get_product_repository() -> ProductRepository:
     if _repo_singleton is None:
         from app.config import settings
 
-        base = getattr(settings, "static_base_url", None) or f"http://127.0.0.1:{settings.port}"
+        base = _normalize_static_base_url(
+            getattr(settings, "static_base_url", None),
+            port=settings.port,
+        )
         _repo_singleton = ProductRepository(static_base_url=base)
     return _repo_singleton

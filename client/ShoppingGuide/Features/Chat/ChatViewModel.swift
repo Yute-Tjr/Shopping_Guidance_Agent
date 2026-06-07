@@ -65,9 +65,9 @@ public final class ChatViewModel: ObservableObject {
         self.speechSpeaker = speechSpeaker
     }
 
-    /// 发送当前 inputText（+ 可选 pickedImage）。空白且无图直接忽略。
-    public func send() async {
-        let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+    /// 发送当前 inputText（+ 可选 pickedImage）。clarify chip 可传入 explicitText，避免经由共享输入框状态中转。
+    public func send(text explicitText: String? = nil) async {
+        let text = (explicitText ?? inputText).trimmingCharacters(in: .whitespacesAndNewlines)
         let picked = pickedImage
         guard !text.isEmpty || picked != nil else { return }
         guard !isSending else { return }

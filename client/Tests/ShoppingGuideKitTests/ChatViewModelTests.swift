@@ -46,6 +46,24 @@ final class ControlledChatTransport: ChatTransport, @unchecked Sendable {
     }
 }
 
+final class RecordingChatTransport: ChatTransport, @unchecked Sendable {
+    var messages: [String] = []
+    let events: [SSEEvent]
+
+    init(events: [SSEEvent] = [.done]) {
+        self.events = events
+    }
+
+    func stream(message: String, sessionID: String?, imageID: String?) -> AsyncStream<SSEEvent> {
+        messages.append(message)
+        let captured = events
+        return AsyncStream { continuation in
+            for e in captured { continuation.yield(e) }
+            continuation.finish()
+        }
+    }
+}
+
 @MainActor
 final class FakeSpeechRecognizer: SpeechRecognizing, @unchecked Sendable {
     var startCount = 0
@@ -192,6 +210,18 @@ struct ChatViewModelTests {
         vm.inputText = "   "
         await vm.send()
         #expect(vm.messages.isEmpty)
+    }
+
+    @Test func explicitClarifyTextBypassesInputDraft() async {
+        let transport = RecordingChatTransport()
+        let vm = ChatViewModel(transport: transport)
+        vm.inputText = "缓震回弹"
+
+        await vm.send(text: "日常慢跑")
+
+        #expect(transport.messages == ["日常慢跑"])
+        #expect(vm.messages.first?.text == "日常慢跑")
+        #expect(vm.inputText == "")
     }
 
     @Test func statusEventsDontPolluteVisibleText() async {
