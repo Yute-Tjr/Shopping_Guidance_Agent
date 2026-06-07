@@ -186,13 +186,30 @@ python -m scripts.eval_image_search --output ../docs/phase5_eval_report.md
 
 ## 8. Docker 沙箱部署
 
-仓库根目录提供 `docker-compose.sandbox.yml`，会启动 MySQL 和 API：
+仓库根目录提供 `docker-compose.sandbox.yml`。`up -d --build` 只会构建镜像并启动 MySQL/API；首次部署必须继续执行建表、灌库和索引构建：
 
 ```bash
 cp server/.env.example server/.env
-# 编辑 server/.env，填真实密钥
+# 编辑 server/.env，填真实密钥、模型 endpoint 和 STATIC_BASE_URL
 docker compose -f docker-compose.sandbox.yml up -d --build
+
+# 首次部署或数据集变化后执行
+docker compose -f docker-compose.sandbox.yml exec api python -m app.db.init_db
+docker compose -f docker-compose.sandbox.yml exec api python -m scripts.seed_mysql --truncate
+docker compose -f docker-compose.sandbox.yml exec api python -m scripts.build_index --rebuild
+
+# 可选：需要图片找货时再建图片索引，会消耗 vision embedding API 配额
+docker compose -f docker-compose.sandbox.yml exec api python -m scripts.build_image_index --rebuild
+
+# 灌库后重启 API，让启动期品牌白名单重新加载
+docker compose -f docker-compose.sandbox.yml restart api
+```
+
+验收：
+
+```bash
 curl http://127.0.0.1:8000/healthz
+BASE_URL=http://127.0.0.1:8000 bash server/scripts/smoke_chat.sh "推荐一款适合油皮的洗面奶"
 ```
 
 注意：
@@ -200,7 +217,7 @@ curl http://127.0.0.1:8000/healthz
 - Compose 中 API 只绑定宿主机 `127.0.0.1:8000`，公网访问通常由 Nginx 反代。
 - 部署到公网时设置 `STATIC_BASE_URL=http://<公网 IP 或域名>`，否则 iOS 拿到的商品图地址可能仍指向本机。
 - 容器内 `MYSQL_DSN` 会覆盖为 `mysql` 服务名，不能沿用本机 `127.0.0.1`。
-- 首次部署仍需在容器内或本机执行灌库和建索引流程，确保 `server/data/milvus_lite.db` 存在。
+- 文本索引会写入宿主机 `server/data/milvus_lite.db`；只改 `.env` 或 `STATIC_BASE_URL` 时不需要重新灌库和建索引，执行 `docker compose -f docker-compose.sandbox.yml up -d --force-recreate api` 即可。
 
 ## 9. 关键问题与解决方案
 

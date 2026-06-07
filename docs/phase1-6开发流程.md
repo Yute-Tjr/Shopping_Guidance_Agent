@@ -1076,6 +1076,7 @@ docker compose -f docker-compose.sandbox.yml exec api python -m app.db.init_db
 docker compose -f docker-compose.sandbox.yml exec api python -m scripts.seed_mysql --truncate
 docker compose -f docker-compose.sandbox.yml exec api python -m scripts.build_index --rebuild
 docker compose -f docker-compose.sandbox.yml exec api python -m scripts.build_image_index --rebuild
+docker compose -f docker-compose.sandbox.yml restart api
 ```
 
 只改 `.env` / `STATIC_BASE_URL` 时无需重新灌库建索引：
